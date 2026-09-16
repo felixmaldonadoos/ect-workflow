@@ -1,0 +1,5 @@
+2026-09-16_10:43:25.577043 | ✏️ | Cluster: "" command="sinfo --json" returned "0" | slurm_viewer.data.slurm_communication:slurm_communication.py:run_command[198]
+2026-09-16_10:43:25.916581 | ✏️ | Cluster: "" command="scontrol --json show nodes" returned "0" | slurm_viewer.data.slurm_communication:slurm_communication.py:run_command[198]
+2026-09-16_10:43:27.785625 | ✏️ | Cluster: "" command="squeue  --json" returned "0" | slurm_viewer.data.slurm_communication:slurm_communication.py:run_command[198]
+2026-09-16_10:43:32.063308 | ✏️ | Cluster: "" command="squeue  --json --me" returned "0" | slurm_viewer.data.slurm_communication:slurm_communication.py:run_command[198]
+2026-09-16_10:43:32.152852 | ✏️ | Cluster: "" command="scontrol --json show nodes" returned "0" | slurm_viewer.data.slurm_communication:slurm_communication.py:run_command[198]

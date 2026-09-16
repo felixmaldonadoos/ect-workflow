@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simnibs-parcel-analysis"
+version = "0.2.0"
+description = "Anatomical atlas ROI, PCA, and outcome analysis for SimNIBS gPC HDF5 results"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib",
+    "nibabel",
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "scipy",
+    "simnibs>=4.6,<5",
+]
+
+[tool.setuptools]
+packages = ["simnibs_parcel_analysis"]
