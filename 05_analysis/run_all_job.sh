@@ -24,3 +24,7 @@ conda activate simnibs_env
 # MAIN original + synthsr
 #######
 python3 run_pca_weighted_global_E_job_synthsr.py
+
+python run_pca_weighted_global_E_job_synthsr.py \
+  --model-type skin_single \
+  --analysis-mode static

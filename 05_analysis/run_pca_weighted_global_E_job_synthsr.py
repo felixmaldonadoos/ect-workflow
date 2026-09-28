@@ -11,22 +11,31 @@ from example_usage_global_E_weighted import run_all_atlases_global_p95_weighted
 from simnibs_parcel_analysis.identifiers import infer_subject_id
 import argparse
 
+MODEL_TYPES = ("skin_single", "skin_double")
+ANALYSIS_STEP_BY_MODE = {
+    "static": "step_0",
+    "adaptive": "step_2",
+}
 
-MODEL_TYPE_DIR  = "skin_single"
-ANALYSIS_STEP   = "step_0"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run pooled atlas PCA analysis.")
+    parser.add_argument("--model-type", choices=MODEL_TYPES, required=True)
+    parser.add_argument("--analysis-mode", choices=tuple(ANALYSIS_STEP_BY_MODE), required=True)
+    return parser.parse_args()
+
+
+QUERY_PATH = Path(
+    "/gpfs/projects/p32903/Alex2/ect-workflow/05_analysis/query_result.csv"
+)
+
+OUTPUT_ROOT = Path(
+    "/projects/p32903/Alex2/results/STU00225089/stats/"
+    "atlas_pca_global_p95_weighted"
+)
 
 COGNITIVE_SCORES_PATH = Path(
     "/projects/p32903/Alex2/datasets/STU00225089/"
     ".clincal_notes/cgi_batch_agg_2_clean.xlsx"
-)
-
-QUERY_PATH = Path(
-    f"/projects/p32903/Alex2/ect-workflow/05_analysis/query_result.{MODEL_TYPE_DIR}.{ANALYSIS_STEP}.csv"
-)
-
-OUTPUT_DIR = Path(
-    "/projects/p32903/Alex2/results/STU00225089/stats/"
-    f"atlas_pca_global_p95_weighted/{MODEL_TYPE_DIR}/{ANALYSIS_STEP}"
 )
 
 FREESURFER_LUT = Path(
@@ -44,8 +53,7 @@ SUBJECTS_DIR_BY_DATASET = {
     ),
 }
 
-
-MIN_VOLUME_ELEMENTS_PER_ROI = 10
+MIN_VOLUME_ELEMENTS_PER_ROI = 9
 
 SUBJECT_MAP = {
     # Add entries only when automatic matching is ambiguous.
@@ -60,6 +68,17 @@ EXCLUDE_VOLUME_ROIS_BY_ATLAS = {
 
 EXCLUDED_SUBJIDS = ("subj-cat-002-003",)
 
+def resolve_analysis_config(model_type: str, analysis_mode: str) -> tuple[str, Path, Path]:
+    if model_type not in MODEL_TYPES:
+        raise ValueError(f"Unsupported model type: {model_type!r}")
+
+    if analysis_mode not in ANALYSIS_STEP_BY_MODE:
+        raise ValueError(f"Unsupported analysis mode: {analysis_mode!r}")
+
+    analysis_step = ANALYSIS_STEP_BY_MODE[analysis_mode]
+    output_dir = OUTPUT_ROOT / model_type / analysis_mode
+
+    return analysis_step, QUERY_PATH, output_dir
 
 def add_base_subjid(df: pd.DataFrame, source_col: str = "subjid") -> pd.DataFrame:
     """Add the person-level base subject ID."""
@@ -268,20 +287,16 @@ def load_hdf5_inventory(
     ).reset_index(drop=True)
 
 
-def validate_analysis_paths() -> None:
-    """Validate shared output resources and both FreeSurfer roots."""
+def validate_analysis_paths(output_dir: Path) -> None:
+    """Validate shared resources and create the analysis output directory."""
     for dataset_root, subjects_dir in SUBJECTS_DIR_BY_DATASET.items():
         if not subjects_dir.is_dir():
-            raise NotADirectoryError(
-                f"SUBJECTS_DIR does not exist for {dataset_root}: {subjects_dir}"
-            )
+            raise NotADirectoryError(f"SUBJECTS_DIR does not exist for {dataset_root}: {subjects_dir}")
 
     if not FREESURFER_LUT.is_file():
-        raise FileNotFoundError(
-            f"FreeSurfer lookup table does not exist: {FREESURFER_LUT}"
-        )
+        raise FileNotFoundError(f"FreeSurfer lookup table does not exist: {FREESURFER_LUT}")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
 def exclude_subject_results(
     inventory: pd.DataFrame,
@@ -308,25 +323,31 @@ def exclude_subject_results(
 
 def main() -> None:
     """Load both sources and run one pooled analysis."""
-    df_cog      = load_cogscores_batch(COGNITIVE_SCORES_PATH)
-    inventory   = load_hdf5_inventory(
-        QUERY_PATH,
+    args = parse_args()
+    analysis_step, query_path, output_dir = resolve_analysis_config(args.model_type, args.analysis_mode)
+
+    print(f"Model type: {args.model_type}")
+    print(f"Analysis mode: {args.analysis_mode}")
+    print(f"Simulation results step: {analysis_step}")
+    print(f"Query table: {query_path}")
+    print(f"Output directory: {output_dir}")
+
+    df_cog = load_cogscores_batch(COGNITIVE_SCORES_PATH)
+    inventory = load_hdf5_inventory(
+        query_path,
         SUBJECTS_DIR_BY_DATASET,
-        MODEL_TYPE_DIR,
-        ANALYSIS_STEP,
+        args.model_type,
+        analysis_step,
     )
     inventory = exclude_subject_results(inventory, list(EXCLUDED_SUBJIDS))
-    
-    validate_analysis_paths()
 
-    inventory.to_csv(
-        OUTPUT_DIR / "selected_hdf5_inventory.csv",
-        index=False,
-    )
+    validate_analysis_paths(output_dir)
+
+    inventory.to_csv(output_dir / "selected_hdf5_inventory.csv", index=False)
 
     for dataset_root in SUBJECTS_DIR_BY_DATASET:
         count = inventory["dataset_root"].eq(dataset_root).sum()
-        print(f"{dataset_root} adaptive HDF5 files: {count}")
+        print(f"{dataset_root} {args.analysis_mode} HDF5 files: {count}")
 
     hdf5_paths = inventory["full_file_path"].tolist()
     subjects_dir_by_hdf5 = {
@@ -334,12 +355,12 @@ def main() -> None:
         for row in inventory.itertuples(index=False)
     }
 
-    print(f"Total adaptive HDF5 files: {len(hdf5_paths)}")
+    print(f"Total {args.analysis_mode} HDF5 files: {len(hdf5_paths)}")
 
     results = run_all_atlases_global_p95_weighted(
         hdf5_paths,
         df_cog,
-        OUTPUT_DIR,
+        output_dir,
         subjects_dir_by_hdf5=subjects_dir_by_hdf5,
         subject_map=SUBJECT_MAP,
         include_surface_hcp=True,
