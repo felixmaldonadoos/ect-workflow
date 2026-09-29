@@ -466,6 +466,7 @@ def run_global_p95_weighted_pca_outcome_analysis(
     summary.qc.to_csv(
         output_dir / "atlas_assignment_qc.csv"
     )
+    
     summary.p95_unweighted.to_csv(
         output_dir / "parcel_p95_unweighted.csv"
     )
