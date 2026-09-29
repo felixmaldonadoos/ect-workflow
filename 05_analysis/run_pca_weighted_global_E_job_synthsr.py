@@ -9,6 +9,7 @@ import pandas as pd
 
 from example_usage_global_E_weighted import run_all_atlases_global_p95_weighted
 from simnibs_parcel_analysis.identifiers import infer_subject_id
+from simnibs_parcel_analysis.pca import DEMEAN_REFERENCES
 import argparse
 
 MODEL_TYPES = ("skin_single", "skin_double")
@@ -21,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run pooled atlas PCA analysis.")
     parser.add_argument("--model-type", choices=MODEL_TYPES, required=True)
     parser.add_argument("--analysis-mode", choices=tuple(ANALYSIS_STEP_BY_MODE), required=True)
+    parser.add_argument("--demean-by", nargs="+", choices=DEMEAN_REFERENCES, default=(),
+                        help="Add these demeaning analyses alongside the existing weighted/unweighted results.")
     return parser.parse_args()
 
 
@@ -372,6 +375,7 @@ def main() -> None:
         min_volume_elements_per_roi=MIN_VOLUME_ELEMENTS_PER_ROI,
         freesurfer_lut=FREESURFER_LUT,
         exclude_volume_rois_by_atlas=EXCLUDE_VOLUME_ROIS_BY_ATLAS,
+        demean_references=args.demean_by,
     )
 
     dk = results["volume_aparc_weighted"]

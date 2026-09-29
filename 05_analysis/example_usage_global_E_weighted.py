@@ -10,7 +10,6 @@ from typing import Literal, Mapping, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import simnibs
 
 from simnibs_parcel_analysis import (
     build_surface_roi_summary,
@@ -22,6 +21,8 @@ from simnibs_parcel_analysis import (
 from simnibs_parcel_analysis.clinical import prepare_scan_course_outcomes
 from simnibs_parcel_analysis.identifiers import infer_subject_id
 from simnibs_parcel_analysis.pca import (
+    DEMEAN_REFERENCES,
+    DemeanReference,
     ParcelPCA,
     components_for_variance,
     correlate_predictors,
@@ -34,6 +35,7 @@ from simnibs_parcel_analysis.pca import (
     plot_top_loadings,
 )
 from simnibs_parcel_analysis.summary import P95Method, ParcelSummary
+from simnibs_parcel_analysis.pipeline import AnalysisResult, run_pca_outcome_analysis
 
 
 @dataclass(frozen=True)
@@ -138,6 +140,12 @@ def combine_parcel_summaries(summaries: Sequence[ParcelSummary]) -> ParcelSummar
     p95_spatial_weighted = _concat_summary_matrices(summaries, "p95_spatial_weighted")
     parcel_size = _concat_summary_matrices(summaries, "parcel_size")
     parcel_count = _concat_summary_matrices(summaries, "parcel_count")
+    has_means = [summary.parcel_mean_e is not None for summary in summaries]
+    if any(has_means) and not all(has_means):
+        raise ValueError("Cannot combine summaries with and without parcel mean E")
+    parcel_mean_e = _concat_summary_matrices(summaries, "parcel_mean_e") if all(has_means) else None
+    if parcel_mean_e is not None and not parcel_mean_e.index.equals(p95_unweighted.index):
+        raise ValueError("Combined parcel_mean_e index differs from p95_unweighted")
 
     for attribute, frame in {
         "p95_spatial_weighted": p95_spatial_weighted,
@@ -195,20 +203,23 @@ def combine_parcel_summaries(summaries: Sequence[ParcelSummary]) -> ParcelSummar
         p95_spatial_weighted=p95_spatial_weighted,
         parcel_size=parcel_size,
         parcel_count=parcel_count,
+        parcel_mean_e=parcel_mean_e,
     )
 
 
 
 
-def build_global_p95_e(
+def build_global_e_statistics(
     hdf5_files: Sequence[str | Path],
     *,
     field_name: str = "magnE_mean",
     mesh_key: str = "mesh_roi",
     brain_tags: Sequence[int] = (1, 2),
     percentile: float = 95.0,
-) -> pd.Series:
-    """Calculate global P95 E across brain tetrahedra for every modeled scan."""
+) -> pd.DataFrame:
+    """Calculate ordinary P95 and arithmetic mean E over selected brain tetrahedra."""
+    import simnibs
+
     hdf5_files = [Path(path) for path in hdf5_files]
 
     if not hdf5_files:
@@ -243,6 +254,7 @@ def build_global_p95_e(
         )
 
     global_p95_values = {}
+    global_mean_values = {}
 
     for subject_id, hdf5_file in zip(
         subject_ids,
@@ -344,6 +356,7 @@ def build_global_p95_e(
             )
 
         brain_field = field[brain_mask]
+        global_mean_values[subject_id] = float(brain_field.mean())
 
         global_p95_values[subject_id] = float(
             np.percentile(
@@ -366,7 +379,23 @@ def build_global_p95_e(
     )
     global_p95_e.index.name = "subjid"
 
-    return global_p95_e
+    global_mean_e = pd.Series(global_mean_values, name="global_mean_brain_E", dtype=float)
+    global_mean_e.index.name = "subjid"
+    return pd.concat([global_p95_e, global_mean_e], axis=1)
+
+
+def build_global_p95_e(
+    hdf5_files: Sequence[str | Path],
+    *,
+    field_name: str = "magnE_mean",
+    mesh_key: str = "mesh_roi",
+    brain_tags: Sequence[int] = (1, 2),
+    percentile: float = 95.0,
+) -> pd.Series:
+    """Backward-compatible global P95 result; ordinary percentiles are unchanged."""
+    statistics = build_global_e_statistics(hdf5_files, field_name=field_name, mesh_key=mesh_key,
+                                           brain_tags=brain_tags, percentile=percentile)
+    return statistics[f"global_p{percentile:g}_E"]
 
 
 def run_global_p95_weighted_pca_outcome_analysis(
@@ -740,9 +769,19 @@ def run_all_atlases_global_p95_weighted(
     field_name: str = "magnE_mean",
     mesh_key: str = "mesh_roi",
     exclude_volume_rois_by_atlas: Mapping[str, Sequence[str]] | None = None,
-    min_volume_elements_per_roi: int = 10) -> dict[str, GlobalP95WeightedAnalysisResult]:
+    min_volume_elements_per_roi: int = 10,
+    demean_references: Sequence[DemeanReference] = (),
+) -> dict[str, GlobalP95WeightedAnalysisResult | AnalysisResult]:
     
-    """Run all atlas analyses with global-brain-P95-weighted PCA."""
+    """Run the existing analyses and optionally add separately exported demeaning modes."""
+    if isinstance(demean_references, (str, bytes)):
+        raise TypeError("demean_references must be a sequence of reference names")
+    demean_references = tuple(demean_references)
+    if len(set(demean_references)) != len(demean_references):
+        raise ValueError("demean_references contains duplicates")
+    unknown_references = sorted(set(demean_references).difference(DEMEAN_REFERENCES))
+    if unknown_references:
+        raise ValueError(f"Unknown demeaning references: {unknown_references}; choose from {DEMEAN_REFERENCES}")
     volume_atlas_names = ("aparc", "a2009s")
     exclude_volume_rois_by_atlas = {} if exclude_volume_rois_by_atlas is None else dict(exclude_volume_rois_by_atlas)
     unsupported_atlases = sorted(set(exclude_volume_rois_by_atlas).difference(volume_atlas_names))
@@ -801,15 +840,31 @@ def run_all_atlases_global_p95_weighted(
     )
 
     # The same scan-level global P95 values are used for every atlas.
-    global_p95_e = build_global_p95_e(
+    global_statistics = build_global_e_statistics(
         hdf5_files,
         field_name=field_name,
         mesh_key=mesh_key,
         brain_tags=brain_tags,
         percentile=global_percentile,
     )
+    global_p95_e = global_statistics[f"global_p{global_percentile:g}_E"]
+    global_mean_brain_e = global_statistics["global_mean_brain_E"]
 
     results = {}
+
+    def add_demeaned_analyses(summary: ParcelSummary, prefix: str, atlas_dir: Path) -> None:
+        methods = [("weighted", "spatial_weighted", "weighted_p95")]
+        if run_unweighted_sensitivity:
+            methods.append(("unweighted", "unweighted", "unweighted_p95_sensitivity"))
+        for reference in demean_references:
+            for label, method, directory in methods:
+                key = f"{prefix}_{label}_demean_{reference}"
+                results[key] = run_pca_outcome_analysis(
+                    summary, cognitive, atlas_dir / directory / f"demean_{reference}",
+                    p95_method=method, outcome_col=outcome_col, demean_by=reference,
+                    global_mean_brain_e=global_mean_brain_e, brain_tags=brain_tags, field_name=field_name,
+                    variance_thresholds=(0.96, 0.97, 0.98, 0.99), pc_correlation_threshold=0.96,
+                )
 
     for atlas_name in volume_atlas_names:
         exclude_roi_names = tuple(exclude_volume_rois_by_atlas.get(atlas_name, ()))
@@ -831,6 +886,7 @@ def run_all_atlases_global_p95_weighted(
                     subject_map=subject_map,
                     freesurfer_lut=freesurfer_lut,
                     field_name=field_name,
+                    mesh_key=mesh_key,
                     percentile=95,
                     min_elements_per_roi=min_volume_elements_per_roi,
                     include_cortex=True,
@@ -878,6 +934,8 @@ def run_all_atlases_global_p95_weighted(
                 exclude_roi_names=exclude_roi_names,
             )
 
+        add_demeaned_analyses(summary, f"volume_{atlas_name}", output_dir / f"volume_{atlas_name}")
+
     if include_surface_hcp:
         hcp_summary = build_surface_roi_summary(
             hdf5_files,
@@ -921,6 +979,8 @@ def run_all_atlases_global_p95_weighted(
                 global_percentile=global_percentile,
                 brain_tags=brain_tags,
             )
+
+        add_demeaned_analyses(hcp_summary, "surface_HCP_MMP1", output_dir / "surface_HCP_MMP1")
 
     return results
 

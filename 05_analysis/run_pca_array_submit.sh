@@ -8,7 +8,7 @@
 # sbatch --array=1,3 run_pca_array.slurm
 
 # # Both skin_double analyses
-sbatch --array=2-3 run_pca_array.slurm
+sbatch --array=2-3 run_pca_array.slurm "$@"
 
 # ALL 
 # sbatch run_pca_array.slurm

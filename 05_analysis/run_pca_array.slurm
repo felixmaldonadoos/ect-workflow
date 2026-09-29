@@ -53,4 +53,4 @@ echo "Python: $(command -v python)"
 # main script runner
 srun python run_pca_weighted_global_E_job_synthsr.py \
     --model-type "$model_type" \
-    --analysis-mode "$analysis_mode"
+    --analysis-mode "$analysis_mode" "$@"

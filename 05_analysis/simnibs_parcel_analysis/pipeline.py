@@ -12,10 +12,13 @@ import pandas as pd
 
 from .clinical import prepare_scan_course_outcomes
 from .pca import (
+    DemeanedParcelPCA,
+    DemeanReference,
     ParcelPCA,
     components_for_variance,
     correlate_predictors,
     fit_parcel_pca,
+    fit_demeaned_parcel_pca,
     global_and_pc_predictors,
     plot_correlation_bars,
     plot_global_outcome,
@@ -32,7 +35,7 @@ class AnalysisResult:
 
     summary: ParcelSummary
     outcomes: pd.DataFrame
-    pca: ParcelPCA
+    pca: ParcelPCA | DemeanedParcelPCA
     global_metrics: pd.DataFrame
     predictors: pd.DataFrame
     correlations: pd.DataFrame
@@ -50,13 +53,21 @@ def run_pca_outcome_analysis(
     variance_thresholds: Sequence[float] = (0.96, 0.99),
     pc_correlation_threshold: float = 0.96,
     n_pcs_for_correlation: int | None = None,
+    demean_by: DemeanReference | None = None,
+    global_mean_brain_e: pd.Series | None = None,
+    brain_tags: Sequence[int] = (1, 2),
+    field_name: str = "magnE_mean",
 ) -> AnalysisResult:
     """Fit the requested PCA, correlate global/PC predictors, and save outputs."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     parcel_values = summary.p95(p95_method)
     outcomes = prepare_scan_course_outcomes(summary.scans, cognitive, outcome_col=outcome_col)
-    pca_result = fit_parcel_pca(parcel_values)
+    if demean_by is None:
+        pca_result = fit_parcel_pca(parcel_values)
+    else:
+        pca_result = fit_demeaned_parcel_pca(parcel_values, demean_by=demean_by,
+                                            global_mean_brain_e=global_mean_brain_e, parcel_mean_e=summary.parcel_mean_e)
     components_by_threshold = {float(value): components_for_variance(pca_result, float(value)) for value in variance_thresholds}
 
     if n_pcs_for_correlation is None:
@@ -77,8 +88,15 @@ def run_pca_outcome_analysis(
     _parcel_qc_table(summary).to_csv(output_dir / "parcel_qc_summary.csv")
     outcomes.to_csv(output_dir / "scan_course_outcomes.csv", index=False)
     global_metrics.to_csv(output_dir / "global_E_metrics.csv")
-    pca_result.relative_parcels.to_csv(output_dir / "parcel_relative_E.csv")
-    pca_result.subject_demeaned_parcels.to_csv(output_dir / "parcel_pca_input.csv")
+    if isinstance(pca_result, DemeanedParcelPCA):
+        pca_result.reference_e.to_csv(output_dir / "parcel_demeaning_reference_E.csv")
+        if demean_by == "parcel_mean":
+            summary.parcel_mean_e.to_csv(output_dir / "parcel_mean_E.csv")
+        elif demean_by == "brain_mean":
+            global_mean_brain_e.reindex(parcel_values.index).rename("global_mean_brain_E").to_csv(output_dir / "global_mean_brain_E.csv")
+    else:
+        pca_result.relative_parcels.to_csv(output_dir / "parcel_relative_E.csv")
+    pca_result.pca_input.to_csv(output_dir / "parcel_pca_input.csv")
     pca_result.scores.to_csv(output_dir / "pca_scores.csv")
     pca_result.loadings.to_csv(output_dir / "pca_loadings.csv")
     pca_result.variance.to_csv(output_dir / "pca_explained_variance.csv")
@@ -92,6 +110,20 @@ def run_pca_outcome_analysis(
         "outcome_column": outcome_col,
         "components_by_threshold": {str(key): value for key, value in components_by_threshold.items()},
         "n_pcs_correlated": n_pcs_for_correlation,
+        "pca_preprocessing": "normalized_subject_demeaned" if demean_by is None else f"demean_{demean_by}",
+        "pca_input_description": pca_result.input_label,
+        "pca_input_file": "parcel_pca_input.csv",
+        "demeaning_reference": demean_by,
+        "demeaning_reference_file": "parcel_demeaning_reference_E.csv" if demean_by is not None else None,
+        "reference_sample_weighting": "arithmetic; equal sample weights",
+        "pca_divide_by_global_mean": demean_by is None,
+        "global_p95_weighting": {"enabled": False},
+        "pca_across_scan_centering": True,
+        "pca_parcel_variance_standardization": False,
+        "field": field_name,
+        "brain_mean_tags": [int(tag) for tag in brain_tags] if demean_by == "brain_mean" else None,
+        "brain_mean_domain": "volume brain tetrahedra, including for surface PCA" if demean_by == "brain_mean" else None,
+        "multiple_testing_family": "global predictors and selected PCs within this atlas/P95/preprocessing run",
         "clinical_observation": "one treatment course per unique (subjid_base, date_start)",
         "predictor_matching": "each modeled scan is matched to every treatment course sharing subjid_base",
         "unmatched_scans": "retained in ROI/PCA outputs and excluded from outcome correlations",
@@ -113,6 +145,7 @@ def run_pca_outcome_analysis(
         plt.close(figure)
 
     print(f"Atlas/domain: {summary.atlas_name}/{summary.domain}")
+    print(f"PCA input: {pca_result.input_label}")
     print(f"Modeled scans: {len(summary.scans)}")
     print(f"Modeled scans with treatment courses: {outcomes['subjid'].nunique()}")
     print(f"Unique people: {summary.scans['subjid_base'].nunique()}")

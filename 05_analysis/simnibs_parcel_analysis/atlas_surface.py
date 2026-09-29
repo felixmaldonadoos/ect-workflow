@@ -8,7 +8,7 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 
 from .mesh_io import build_hdf5_inventory, fsaverage_surface_path, load_surface_mesh, node_areas, scalar_mesh_field
-from .summary import ParcelSummary, build_parcel_summary, summarize_labeled_field
+from .summary import ParcelSummary, build_parcel_summary, mean_labeled_field, summarize_labeled_field
 
 
 SURFACE_ATLASES = frozenset({"HCP_MMP1", "DK40", "a2009s"})
@@ -79,6 +79,7 @@ def build_surface_roi_summary(
     atlas_masks = atlas_loader(atlas_name)
 
     ordinary_rows, weighted_rows, size_rows, count_rows, qc_rows = [], [], [], [], []
+    mean_rows = []
     expected_rois = None
     for row in scans.itertuples(index=False):
         mesh = load_surface_mesh(row.surface_file, mesh_loader=mesh_loader)
@@ -104,6 +105,7 @@ def build_surface_roi_summary(
         weighted_rows.append(weighted)
         size_rows.append(parcel_size)
         count_rows.append(parcel_count)
+        mean_rows.append(mean_labeled_field(field, labels, label_names))
         qc_rows.append(
             {
                 "surface_file": row.surface_file,
@@ -123,4 +125,5 @@ def build_surface_roi_summary(
         qc_rows,
         atlas_name=atlas_name,
         domain="surface",
+        mean_rows=mean_rows,
     )
