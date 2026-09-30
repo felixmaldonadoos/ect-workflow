@@ -2,14 +2,306 @@
 
 from __future__ import annotations
 
+import json
+from numbers import Real
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal, Mapping, Sequence
 import warnings
 
 import numpy as np
 import pandas as pd
 
-from .identifiers import add_subject_id_columns, build_scan_table
+from .identifiers import add_subject_id_columns, base_subject_id, build_scan_table
+
+
+def load_ect_sessions(fn: str | Path, sheet_name: str | int = "stimulus") -> pd.DataFrame:
+    """Load one row per ECT session, preserving all clinical columns.
+
+    Validate only the session identity, date, and placement needed for matching.
+    Other treatment variables remain untouched, including a temporary ``age``
+    placeholder in frequency_hz. Session numbers need not restart at each series.
+    No CGI eligibility filter or electric-field scaling is applied.
+    """
+    path = _require_file(fn, "ECT-session file")
+    if path.suffix.lower() != ".xlsx":
+        raise ValueError(f"ECT-session file must be .xlsx: {path}")
+    if isinstance(sheet_name, bool) or not isinstance(sheet_name, (str, int)):
+        raise TypeError("sheet_name must identify one sheet by name or integer index")
+    raw = pd.read_excel(path, sheet_name=sheet_name, header=None, keep_default_na=False, na_values=[""])
+    return _validate_ect_sessions(_ect_table_from_header(raw, "ECT-session sheet"))
+
+
+def load_hdf5_query(
+    fn: str | Path | pd.DataFrame,
+    *,
+    model_type: Literal["skin_single", "skin_double"],
+    simulation_type: Literal["static", "adaptive", "step_0", "step_2"],
+    query_filters: Mapping[str, str | int] | None = None,
+) -> pd.DataFrame:
+    """Select HDF5 records from a query CSV or an already loaded query table.
+
+    model_type filters model_type_dir; static means step_0 and adaptive means
+    step_2. Optional query_filters select exact metadata values, for example
+    dataset_root, threshold, sim_result, or filename (derived when absent).
+    This uses exported paths directly; it never scans directories or opens HDF5s.
+    Multiple runs or datasets are retained for the mapper to check for ambiguity.
+    """
+    if model_type not in {"skin_single", "skin_double"}:
+        raise ValueError("model_type must be 'skin_single' or 'skin_double'")
+    steps = {"static": "step_0", "adaptive": "step_2", "step_0": "step_0", "step_2": "step_2"}
+    if simulation_type not in steps:
+        raise ValueError("simulation_type must be 'static', 'adaptive', 'step_0', or 'step_2'")
+    step = steps[simulation_type]
+    if isinstance(fn, pd.DataFrame):
+        query = _ect_clean_columns(fn, "Results-query table")
+    else:
+        path = _require_file(fn, "Results-query file")
+        raw = pd.read_csv(path, header=None, dtype="string", keep_default_na=False)
+        query = _ect_table_from_header(raw, "Results-query file")
+    required = ["model_type_dir", "step", "subject_dir", "electrode_configuration", "full_file_path"]
+    _require_columns(query, required, "Results-query table")
+    query["model_type_dir"] = query["model_type_dir"].astype("string").str.strip()
+    query["step"] = query["step"].astype("string").str.strip()
+    query = query.loc[query["model_type_dir"].eq(model_type) & query["step"].eq(step)].copy()
+    if "filename" not in query.columns:
+        query["filename"] = query["full_file_path"].map(lambda value: Path(str(value).strip()).name)
+    for column, value in (query_filters or {}).items():
+        if column in {"model_type_dir", "step"}:
+            raise ValueError(f"Select {column!r} through model_type/simulation_type, not query_filters")
+        _require_columns(query, [column], "Results-query table")
+        if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip():
+            raise ValueError(f"query_filters[{column!r}] must be a nonempty string or integer")
+        query = query.loc[query[column].astype("string").str.strip().eq(str(value).strip())].copy()
+    query["full_file_path"] = _ect_required_text(query, "full_file_path", "Results-query table")
+    is_hdf5 = query["full_file_path"].map(lambda value: Path(value).suffix.lower() in {".hdf5", ".h5"})
+    query = query.loc[is_hdf5].copy()
+    if query.empty:
+        raise ValueError(f"No HDF5 records match model_type={model_type!r}, step={step!r}, {query_filters=}")
+    ids = add_subject_id_columns(query[["subject_dir"]].rename(columns={"subject_dir": "subjid"}), require_scan=True)
+    query["modeled_subjid"] = ids["subjid"]
+    query["subjid_base"] = ids["subjid_base"]
+    placement = _ect_required_text(query, "electrode_configuration", "Results-query table")
+    query["electrode_placement"] = placement.str.upper()
+    _ect_check_placements(query["electrode_placement"], "Results-query table")
+    query["hdf5_fn"] = query["full_file_path"]
+    return query.reset_index(drop=True)
+
+
+def load_subject_scan_map(subject_scan_map: Mapping[str, str] | str | Path | None = None) -> dict[str, str]:
+    """Read and validate {base_subject_id: preferred_modeled_scan_id}.
+
+    Accept an in-memory dictionary or a JSON object stored in its own file.
+    Entries are optional for patients with one candidate scan. A map may include
+    other patients, so it can be reused across sheets and simulation conditions.
+    Duplicate JSON keys, conflicting normalized keys, and cross-patient choices
+    are errors. No scan is inferred from series_num or session_num.
+    """
+    if subject_scan_map is None:
+        return {}
+    if isinstance(subject_scan_map, (str, Path)):
+        path = _require_file(subject_scan_map, "Subject-scan map")
+        with path.open(encoding="utf-8") as handle:
+            subject_scan_map = json.load(handle, object_pairs_hook=_ect_unique_json_object)
+    if not isinstance(subject_scan_map, Mapping):
+        raise TypeError("subject_scan_map must be a dictionary, a JSON-file path, or None")
+    result = {}
+    for subject, scan in subject_scan_map.items():
+        if not isinstance(subject, str) or not isinstance(scan, str):
+            raise TypeError("subject_scan_map keys and values must be subject-ID strings")
+        subject, scan = subject.strip(), scan.strip()
+        if subject != base_subject_id(subject):
+            raise ValueError(f"subject_scan_map key must be a base subject ID: {subject!r}")
+        if base_subject_id(scan, require_scan=True) != subject:
+            raise ValueError(f"Preferred scan {scan!r} belongs to a different patient than {subject!r}")
+        if subject in result:
+            raise ValueError(f"Duplicate subject_scan_map key after stripping whitespace: {subject!r}")
+        result[subject] = scan
+    return result
+
+
+def map_sessions_to_hdf5(
+    sessions: pd.DataFrame,
+    query_results: str | Path | pd.DataFrame,
+    *,
+    model_type: Literal["skin_single", "skin_double"],
+    simulation_type: Literal["static", "adaptive", "step_0", "step_2"],
+    subject_scan_map: Mapping[str, str] | str | Path | None = None,
+    query_filters: Mapping[str, str | int] | None = None,
+    electrode_placement_map: Mapping[str, str] | None = None,
+) -> pd.DataFrame:
+    """Attach exactly one hdf5_fn and modeled_subjid to every ECT session.
+
+    Match by base patient ID and the placement used in that individual session.
+    Use subject_scan_map whenever the selected results contain multiple scans
+    for that patient, even if different scans supply different placements.
+    Clinical scan suffixes do not override the explicitly preferred scan.
+    Multiple remaining files or missing matches raise with diagnostic tables.
+    Repeated sessions can share an HDF5; row order, index, and count are retained.
+
+    BL and BT remain distinct unless electrode_placement_map explicitly maps
+    them, e.g. {"BT": "BL"}. Such an alias is the caller's modeling decision.
+    """
+    result = _validate_ect_sessions(sessions)
+    reserved = {"hdf5_fn", "modeled_subjid"}.intersection(result.columns)
+    if reserved:
+        raise ValueError(f"Session table already contains output columns: {sorted(reserved)}")
+    query = load_hdf5_query(query_results, model_type=model_type, simulation_type=simulation_type,
+                           query_filters=query_filters)
+    preferred = load_subject_scan_map(subject_scan_map)
+    placements = _ect_placement_aliases(electrode_placement_map)
+    subjects = result["subjid_base"].unique()
+    query = query.loc[query["subjid_base"].isin(subjects)].copy()
+    available = query.groupby("subjid_base")["modeled_subjid"].unique().to_dict()
+    chosen, ambiguous = {}, {}
+    for subject in subjects:
+        scans = sorted(available.get(subject, []))
+        if subject in preferred:
+            if preferred[subject] not in scans:
+                raise ValueError(f"Preferred scan {preferred[subject]!r} is unavailable after filtering; {scans=}")
+            chosen[subject] = preferred[subject]
+        elif len(scans) > 1:
+            ambiguous[subject] = scans
+        elif scans:
+            chosen[subject] = scans[0]
+    if ambiguous:
+        raise ValueError("Multiple modeled scans require subject_scan_map={base_subjid: preferred_scan}: "
+                         + str(ambiguous))
+    query = query.loc[query["modeled_subjid"].eq(query["subjid_base"].map(chosen))].copy()
+
+    keys = ["subjid_base", "electrode_placement"]
+    matching = result[keys].copy()
+    matching["electrode_placement"] = matching["electrode_placement"].replace(placements)
+    wanted_keys = pd.MultiIndex.from_frame(matching)
+    query = query.loc[pd.MultiIndex.from_frame(query[keys]).isin(wanted_keys)].copy()
+    # Exact repeated records for the same file are one candidate, not extra sessions.
+    candidates = query[[*keys, "modeled_subjid", "hdf5_fn"]].drop_duplicates()
+    repeated_path = candidates["hdf5_fn"].duplicated(keep=False)
+    if repeated_path.any():
+        details = candidates.loc[repeated_path].to_string(index=False)
+        raise ValueError("One HDF5 path has conflicting subject/placement metadata:\n" + details)
+    multiple = candidates.duplicated(keys, keep=False)
+    if multiple.any():
+        diagnostic_columns = [c for c in [*keys, "dataset_root", "threshold", "sim_result", "hdf5_fn"] if c in query]
+        conflicting_keys = pd.MultiIndex.from_frame(candidates.loc[multiple, keys])
+        details = query.loc[pd.MultiIndex.from_frame(query[keys]).isin(conflicting_keys), diagnostic_columns]
+        raise ValueError("Multiple HDF5 files match a session; restrict query_filters or the query export:\n"
+                         + details.drop_duplicates().to_string(index=False))
+    joined = matching.merge(candidates, on=keys, how="left", sort=False, validate="many_to_one")
+    if len(joined) != len(result):
+        raise RuntimeError(f"HDF5 matching changed the session count: {len(result)} -> {len(joined)}")
+    missing = joined["hdf5_fn"].isna().to_numpy()
+    if missing.any():
+        details = result.loc[missing, ["subjid", "series_num", "session_num", "date", "electrode_placement"]]
+        raise ValueError("No matching HDF5 for these sessions; no sessions were removed and no fallback was used:\n"
+                         + details.to_string())
+    result["modeled_subjid"] = joined["modeled_subjid"].to_numpy()
+    result["hdf5_fn"] = joined["hdf5_fn"].to_numpy()
+    return result
+
+
+def load_ect_sessions_with_hdf5(
+    fn: str | Path,
+    sheet_name: str | int,
+    query_results: str | Path | pd.DataFrame,
+    *,
+    model_type: Literal["skin_single", "skin_double"],
+    simulation_type: Literal["static", "adaptive", "step_0", "step_2"],
+    subject_scan_map: Mapping[str, str] | str | Path | None = None,
+    query_filters: Mapping[str, str | int] | None = None,
+    electrode_placement_map: Mapping[str, str] | None = None,
+) -> pd.DataFrame:
+    """Load an ECT-session sheet and attach its session-specific HDF5 paths."""
+    sessions = load_ect_sessions(fn, sheet_name)
+    return map_sessions_to_hdf5(sessions, query_results, model_type=model_type, simulation_type=simulation_type,
+                               subject_scan_map=subject_scan_map, query_filters=query_filters,
+                               electrode_placement_map=electrode_placement_map)
+
+
+def _ect_clean_columns(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    result = df.copy()
+    names = pd.Index(result.columns.astype(str).str.strip())
+    if names.duplicated().any():
+        raise ValueError(f"{label} has duplicate column names: {names[names.duplicated()].tolist()}")
+    result.columns = names
+    return result
+
+
+def _ect_table_from_header(raw: pd.DataFrame, label: str) -> pd.DataFrame:
+    if raw.empty:
+        raise ValueError(f"{label} is empty")
+    header = raw.iloc[0].astype("string").str.strip()
+    if header.isna().any() or header.eq("").any():
+        raise ValueError(f"{label} contains blank column names")
+    table = raw.iloc[1:].reset_index(drop=True).copy()
+    table.columns = header.tolist()
+    return _ect_clean_columns(table, label)
+
+
+def _ect_required_text(df: pd.DataFrame, column: str, label: str) -> pd.Series:
+    values = df[column].astype("string").str.strip()
+    missing = values.isna() | values.eq("")
+    if missing.any():
+        raise ValueError(f"{label} has missing {column!r} at rows: {df.index[missing].tolist()}")
+    return values
+
+
+def _ect_check_placements(placements: pd.Series, label: str) -> None:
+    invalid = ~placements.isin({"RUL", "BL", "BT", "BF"})
+    if invalid.any():
+        raise ValueError(f"{label} has invalid electrode placements: {placements.loc[invalid].to_dict()}")
+
+
+def _validate_ect_sessions(df: pd.DataFrame) -> pd.DataFrame:
+    result = _ect_clean_columns(df, "ECT-session table")
+    required = ["subjid", "series_num", "session_num", "date", "electrode_placement"]
+    _require_columns(result, required, "ECT-session table")
+    if result.empty:
+        raise ValueError("ECT-session table contains no sessions")
+    result = add_subject_id_columns(result, require_scan=False)
+    for column in ["series_num", "session_num"]:
+        if result[column].map(lambda value: isinstance(value, (bool, np.bool_))).any():
+            raise ValueError(f"{column} must contain positive integers, not booleans")
+        values = pd.to_numeric(result[column], errors="raise")
+        valid = values.notna() & np.isfinite(values) & values.gt(0) & values.lt(2**63) & values.mod(1).eq(0)
+        if not valid.all():
+            raise ValueError(f"{column} must contain positive integers at rows: {result.index[~valid].tolist()}")
+        result[column] = values.astype("int64")
+    dates = _ect_required_text(result, "date", "ECT-session table")
+    if result["date"].map(lambda value: isinstance(value, (Real, np.bool_))).any():
+        raise ValueError("ECT-session dates must be dates or date strings, not unformatted numeric Excel serials")
+    result["date"] = pd.to_datetime(dates, format="mixed", errors="raise").dt.normalize()
+    if result["date"].isna().any():
+        raise ValueError(f"Invalid ECT-session dates at rows: {result.index[result['date'].isna()].tolist()}")
+    result["electrode_placement"] = _ect_required_text(result, "electrode_placement", "ECT-session table").str.upper()
+    _ect_check_placements(result["electrode_placement"], "ECT-session table")
+    duplicate = result.duplicated(["subjid_base", "series_num", "session_num"], keep=False)
+    if duplicate.any():
+        details = result.loc[duplicate, ["subjid", "series_num", "session_num", "date"]].to_string()
+        raise ValueError("Duplicate patient/series/session records:\n" + details)
+    return result
+
+
+def _ect_unique_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key in subject_scan_map: {key!r}")
+        result[key] = value
+    return result
+
+
+def _ect_placement_aliases(mapping: Mapping[str, str] | None) -> dict[str, str]:
+    aliases = {}
+    for source, target in (mapping or {}).items():
+        if not isinstance(source, str) or not isinstance(target, str):
+            raise TypeError("electrode_placement_map keys and values must be placement strings")
+        source, target = source.strip().upper(), target.strip().upper()
+        _ect_check_placements(pd.Series([source, target]), "electrode_placement_map")
+        if source in aliases:
+            raise ValueError(f"Duplicate electrode_placement_map key after normalization: {source!r}")
+        aliases[source] = target
+    return aliases
+
 
 def collapse_person_rows(
     df: pd.DataFrame,
