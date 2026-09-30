@@ -2,6 +2,7 @@
 **/logs/**
 *.tar.gz
 **/query_result.csv/**
+**/query*.csv/**
 # Python
 __pycache__/
 *.py[cod]
