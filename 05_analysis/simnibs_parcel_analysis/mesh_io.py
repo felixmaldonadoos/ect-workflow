@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+
 from pathlib import Path
 from typing import Callable, Literal, Sequence
-
+import warnings
 import numpy as np
 import pandas as pd
 
@@ -128,30 +129,77 @@ def mesh_array(value) -> np.ndarray:
     return np.asarray(raw)
 
 
-def scalar_mesh_field(mesh, field_name: str, *, expected_location: Literal["element", "node"] | None = None) -> tuple[np.ndarray, str]:
-    """Extract and strictly validate one scalar mesh field."""
-    if field_name not in mesh.field:
-        raise KeyError(f"Field {field_name!r} not found; available fields: {sorted(mesh.field.keys())}")
-    element_fields = {field.field_name for field in mesh.elmdata}
-    node_fields = {field.field_name for field in mesh.nodedata}
-    if field_name in element_fields and field_name in node_fields:
+def scalar_mesh_field(
+    mesh,
+    field_name: str,
+    *,
+    expected_location: Literal["element", "node"] | None = None,
+    negative_atol: float = 1e-8,
+) -> tuple[np.ndarray, str]:
+    """Extract a finite, nonnegative scalar field without modifying the mesh.
+
+    Validate the entire field. Warn and zero values in [-negative_atol, 0)
+    in a copy; negative_atol uses the same units as the field.
+    """
+    if expected_location not in (None, "element", "node"):
+        raise ValueError("expected_location must be 'element', 'node', or None")
+
+    if isinstance(negative_atol, (bool, np.bool_)) or not isinstance(
+        negative_atol, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("negative_atol must be numeric")
+    if not np.isfinite(negative_atol) or negative_atol < 0:
+        raise ValueError("negative_atol must be finite and nonnegative")
+
+    element_fields = [item for item in mesh.elmdata if item.field_name == field_name]
+    node_fields = [item for item in mesh.nodedata if item.field_name == field_name]
+
+    if not element_fields and not node_fields:
+        available = sorted({item.field_name for item in [*mesh.elmdata, *mesh.nodedata]})
+        raise KeyError(f"Field {field_name!r} not found; available fields: {available}")
+    if element_fields and node_fields:
         raise ValueError(f"Field {field_name!r} exists as both ElementData and NodeData")
-    if field_name in element_fields:
-        location, expected = "element", int(mesh.elm.nr)
-    elif field_name in node_fields:
-        location, expected = "node", int(mesh.nodes.nr)
-    else:
-        raise ValueError(f"Could not determine whether field {field_name!r} is element or node data")
+
+    matches = element_fields or node_fields
+    if len(matches) != 1:
+        raise ValueError(f"Multiple fields named {field_name!r} at the same location")
+
+    location, expected = ("element", int(mesh.elm.nr)) if element_fields else ("node", int(mesh.nodes.nr))
     if expected_location is not None and location != expected_location:
         raise ValueError(f"Field {field_name!r} must be {expected_location} data, got {location} data")
 
-    values = np.asarray(mesh_array(mesh.field[field_name]), dtype=float).squeeze()
-    if values.ndim != 1 or values.size != expected:
-        raise ValueError(f"Field {field_name!r} has shape {values.shape}; expected ({expected},)")
-    if not np.isfinite(values).all() or (values < 0).any():
-        raise ValueError(f"Field {field_name!r} must contain finite, nonnegative scalar values")
-    return values, location
+    raw = mesh_array(matches[0])
+    if np.iscomplexobj(raw):
+        raise ValueError(f"Field {field_name!r} must contain real values")
 
+    values = np.asarray(raw, dtype=float)
+    if values.ndim == 2 and values.shape[1] == 1:
+        values = values[:, 0]
+
+    if values.shape != (expected,):
+        raise ValueError(f"Field {field_name!r} has shape {values.shape}; expected ({expected},)")
+    if not np.isfinite(values).all():
+        raise ValueError(f"Field {field_name!r} contains nonfinite values")
+
+    invalid = values < -negative_atol
+    if invalid.any():
+        raise ValueError(
+            f"Field {field_name!r} contains {invalid.sum()} values below "
+            f"-{negative_atol:g}; minimum={values.min():.8g}"
+        )
+
+    negative = values < 0
+    if negative.any():
+        warnings.warn(
+            f"Field {field_name!r}: setting {negative.sum()} negligible negatives "
+            f"to zero; minimum={values.min():.8g}; tolerance={negative_atol:g}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        values = values.copy()
+        values[negative] = 0.0
+
+    return values, location
 
 def element_geometry(mesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return element barycenters, element sizes, and element types."""
