@@ -3,7 +3,7 @@
 This package analyzes `magnE_mean` stored in the `mesh_roi` group of SimNIBS
 gPC HDF5 files. It supports two anatomically distinct workflows:
 
-- **Volume:** subject-specific FreeSurfer `aparc+aseg.mgz` (Desikan–Killiany)
+- **Volume:** subject-specific FreeSurfer `aparc+aseg.mgz` (Desikanâ€“Killiany)
   or `aparc.a2009s+aseg.mgz` (Destrieux) labels sampled at tetrahedron
   barycenters.
 - **Surface:** `HCP_MMP1`, `DK40`, or `a2009s` masks applied to E-fields that
@@ -29,7 +29,7 @@ The PCA input follows the requested order exactly:
 2. Calculate the equal-parcel global mean P95 within each scan.
 3. Divide every parcel by that scan's global mean.
 4. Demean the relative parcel values within each scan.
-5. Fit unscaled PCA to the scans × parcels matrix. Scikit-learn centers each
+5. Fit unscaled PCA to the scans Ã— parcels matrix. Scikit-learn centers each
    parcel across scans during PCA.
 
 The two global predictors are:
@@ -92,7 +92,7 @@ identifier. A treatment course is uniquely identified by
 CGI changes. Two clinical rows with the same base ID and `date_start` are a
 conflict and stop the analysis.
 
-PCA remains scans × parcels. For outcome correlations, every modeled scan is
+PCA remains scans Ã— parcels. For outcome correlations, every modeled scan is
 matched to every treatment course sharing its `subjid_base`, producing a unique
 `observation_id = modeled scan + course start date`. The current Pearson
 correlations treat these scan-course rows as independent. Because scans and
@@ -146,11 +146,20 @@ python run_pca_weighted_global_E_job_synthsr.py \
     --demean-by brain_mean parcel_p95_mean parcel_mean
 ```
 
-The same arguments can be passed through the Slurm array script:
+The submission wrapper creates the log directory and sets the job working
+directory. By default it submits all four model/step combinations with all
+three demeaning modes:
 
 ```bash
-sbatch run_pca_array.slurm --demean-by brain_mean parcel_p95_mean parcel_mean
+bash run_pca_array_submit.sh
+ARRAY_TASKS=1,3 bash run_pca_array_submit.sh --demean-by parcel_mean
+ARRAY_TASKS=2-3 bash run_pca_array_submit.sh --existing-only
 ```
+
+Array indices 0/1 are skin_single static/adaptive; 2/3 are skin_double
+static/adaptive. An optional concurrency cap is supported, e.g.
+`ARRAY_TASKS=0-3%2`. Logs use `logs/atlas_pca/<array-id>_<task-id>.out`
+and `.err`. Each worker makes exactly one Python analysis call.
 
 For the Python all-atlas API, add this keyword to the existing call:
 

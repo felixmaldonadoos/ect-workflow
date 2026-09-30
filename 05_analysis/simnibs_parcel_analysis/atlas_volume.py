@@ -10,7 +10,7 @@ import numpy as np
 
 from .identifiers import resolve_freesurfer_subjects
 from .mesh_io import build_hdf5_inventory, element_geometry, load_hdf5_mesh, scalar_mesh_field
-from .summary import ParcelSummary, build_parcel_summary, summarize_labeled_field
+from .summary import ParcelSummary, build_parcel_summary, mean_labeled_field, summarize_labeled_field
 
 
 VOLUME_ATLAS_FILES = {
@@ -256,6 +256,7 @@ def build_volume_roi_summary(
             raise ValueError(f"mesh_to_atlas_ras key mismatch; missing={missing_transforms}, extra={extra_transforms}")
 
     ordinary_rows, weighted_rows, size_rows, count_rows, qc_rows = [], [], [], [], []
+    mean_rows = []
     expected_rois = None
     for row in scans.itertuples(index=False):
         mesh = load_hdf5_mesh(row.hdf5_file, mesh_key=mesh_key, mesh_loader=mesh_loader)
@@ -299,6 +300,7 @@ def build_volume_roi_summary(
         weighted_rows.append(weighted)
         size_rows.append(parcel_size)
         count_rows.append(parcel_count)
+        mean_rows.append(mean_labeled_field(field[tetrahedra], sampled_labels, label_names))
         qc_rows.append(
             {
                 "atlas_file": row.atlas_file,
@@ -320,4 +322,5 @@ def build_volume_roi_summary(
         qc_rows,
         atlas_name=canonical,
         domain="volume",
+        mean_rows=mean_rows,
     )

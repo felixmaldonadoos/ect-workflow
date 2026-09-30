@@ -38,11 +38,15 @@ from .mesh_io import (
     load_surface_mesh,
 )
 from .pca import (
+    DEMEAN_REFERENCES,
+    DemeanReference,
+    DemeanedParcelPCA,
     ParcelPCA,
     components_for_variance,
     correlate_predictors,
     expand_predictors_to_courses,
     fit_parcel_pca,
+    fit_demeaned_parcel_pca,
     global_and_pc_predictors,
     plot_correlation_bars,
     plot_global_outcome,
@@ -55,6 +59,10 @@ from .summary import P95Method, ParcelSummary, global_metrics_from_parcels, weig
 from .identifiers import infer_subject_id
 
 __all__ = [
+    "DEMEAN_REFERENCES",
+    "DemeanReference",
+    "DemeanedParcelPCA",
+    "fit_demeaned_parcel_pca",
     "AnalysisResult",
     "DEFAULT_SUBCORTICAL_STRUCTURES",
     "P95Method",

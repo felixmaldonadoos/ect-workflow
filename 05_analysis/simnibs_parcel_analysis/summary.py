@@ -25,6 +25,7 @@ class ParcelSummary:
     atlas_name: str
     domain: Literal["volume", "surface"]
     size_unit: Literal["mm3", "mm2"]
+    parcel_mean_e: pd.DataFrame | None = None
 
     def p95(self, method: P95Method = "spatial_weighted") -> pd.DataFrame:
         """Return the requested parcel-by-scan P95 matrix."""
@@ -118,6 +119,7 @@ def build_parcel_summary(
     *,
     atlas_name: str,
     domain: Literal["volume", "surface"],
+    mean_rows: list[pd.Series] | None = None,
 ) -> ParcelSummary:
     """Assemble per-scan rows after enforcing identical parcel columns."""
     if not (len(scans) == len(ordinary_rows) == len(weighted_rows) == len(size_rows) == len(count_rows) == len(qc_rows)):
@@ -134,6 +136,17 @@ def build_parcel_summary(
     if (frames[2] <= 0).any().any() or (frames[3] < 1).any().any():
         raise ValueError("Parcel sizes and counts must be positive")
 
+    parcel_mean_e = None
+    if mean_rows is not None:
+        if len(mean_rows) != len(scans):
+            raise ValueError("Parcel mean row count does not match scan count")
+        parcel_mean_e = pd.DataFrame(mean_rows, index=index)
+        if not parcel_mean_e.columns.equals(expected):
+            raise ValueError("Parcel mean columns differ from parcel P95 columns")
+        means = parcel_mean_e.to_numpy(dtype=float)
+        if not np.isfinite(means).all() or (means < 0).any():
+            raise ValueError("Parcel means must be finite and nonnegative")
+
     qc = pd.DataFrame(qc_rows, index=index)
     return ParcelSummary(
         scans=scans.reset_index(drop=True),
@@ -145,7 +158,26 @@ def build_parcel_summary(
         atlas_name=atlas_name,
         domain=domain,
         size_unit="mm3" if domain == "volume" else "mm2",
+        parcel_mean_e=parcel_mean_e,
     )
+
+
+def mean_labeled_field(values: np.ndarray, labels: np.ndarray, label_names: Mapping[int, str]) -> pd.Series:
+    """Arithmetic mean of raw E samples per parcel; no volume/area weighting."""
+    values, labels = np.asarray(values, dtype=float), np.asarray(labels)
+    if values.ndim != 1 or labels.shape != values.shape:
+        raise ValueError("values and labels must be equally sized one-dimensional arrays")
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError("Raw E samples must be finite and nonnegative")
+    if not label_names or len(set(label_names.values())) != len(label_names):
+        raise ValueError("Parcel names must be nonempty and unique")
+    means = {}
+    for label_id, name in sorted(label_names.items(), key=lambda item: item[1]):
+        samples = values[labels == int(label_id)]
+        if samples.size == 0:
+            raise ValueError(f"Cannot calculate mean E for empty parcel {name!r}")
+        means[name] = float(samples.mean())
+    return pd.Series(means, dtype=float)
 
 
 def global_metrics_from_parcels(parcel_values: pd.DataFrame, parcel_size: pd.DataFrame) -> pd.DataFrame:

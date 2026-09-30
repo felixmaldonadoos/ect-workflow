@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,7 +20,7 @@ class ParcelPCA:
 
     parcel_p95: pd.DataFrame
     global_mean_e: pd.Series
-    global_p95_e: pd.Series
+    global_p95_e: pd.Series | None
     relative_parcels: pd.DataFrame
     subject_demeaned_parcels: pd.DataFrame
     global_p95_weighted_parcels: pd.DataFrame
@@ -28,6 +28,116 @@ class ParcelPCA:
     loadings: pd.DataFrame
     variance: pd.DataFrame
     model: PCA
+
+    @property
+    def pca_input(self) -> pd.DataFrame:
+        """Matrix supplied to PCA, before its across-scan centering."""
+        return self.global_p95_weighted_parcels
+
+    @property
+    def input_label(self) -> str:
+        if self.global_p95_e is None:
+            return "Demeaned relative parcel P95 E (dimensionless)"
+        return "Demeaned relative parcel P95 E × global brain P95 E"
+
+
+DemeanReference = Literal["brain_mean", "parcel_p95_mean", "parcel_mean"]
+DEMEAN_REFERENCES = ("brain_mean", "parcel_p95_mean", "parcel_mean")
+DEMEAN_DESCRIPTIONS = {
+    "brain_mean": "Parcel P95 E minus arithmetic mean E across selected brain tetrahedra",
+    "parcel_p95_mean": "Parcel P95 E minus within-scan arithmetic mean of parcel P95 values",
+    "parcel_mean": "Parcel P95 E minus arithmetic mean of raw E samples in that parcel",
+}
+
+
+@dataclass(frozen=True)
+class DemeanedParcelPCA:
+    """PCA of signed parcel P95 deviations, without normalization or P95 scaling."""
+
+    parcel_p95: pd.DataFrame
+    reference_e: pd.DataFrame
+    demeaned_parcels: pd.DataFrame
+    demean_by: DemeanReference
+    scores: pd.DataFrame
+    loadings: pd.DataFrame
+    variance: pd.DataFrame
+    model: PCA
+
+    @property
+    def pca_input(self) -> pd.DataFrame:
+        return self.demeaned_parcels
+
+    @property
+    def input_label(self) -> str:
+        return DEMEAN_DESCRIPTIONS[self.demean_by]
+
+def fit_demeaned_parcel_pca(
+    parcel_p95: pd.DataFrame,
+    *,
+    demean_by: DemeanReference,
+    global_mean_brain_e: pd.Series | None = None,
+    parcel_mean_e: pd.DataFrame | None = None,
+) -> DemeanedParcelPCA:
+    """Subtract one explicit reference from raw parcel P95 values and fit PCA.
+
+    ``brain_mean`` uses arithmetic mean E over selected brain tetrahedra.
+    ``parcel_p95_mean`` uses the arithmetic mean across this scan's parcel P95s.
+    ``parcel_mean`` uses arithmetic means of raw samples within each parcel.
+    The latter is equivalent to centering samples before taking their P95.
+    Signed deviations are valid. No division, additional row demeaning,
+    spatial standardization, or global-P95 multiplication is performed.
+    """
+    if demean_by not in DEMEAN_REFERENCES:
+        raise ValueError(f"demean_by must be one of {DEMEAN_REFERENCES}, got {demean_by!r}")
+    _validate_subject_parcel_frame(parcel_p95)
+    parcels = parcel_p95.astype(float).copy()
+    if demean_by == "parcel_p95_mean":
+        reference = pd.DataFrame(np.repeat(parcels.mean(axis=1).to_numpy()[:, None], parcels.shape[1], axis=1),
+                                 index=parcels.index, columns=parcels.columns)
+    elif demean_by == "brain_mean":
+        if not isinstance(global_mean_brain_e, pd.Series):
+            raise TypeError("brain_mean requires global_mean_brain_e as a pandas Series")
+        _require_matching_labels(global_mean_brain_e.index, parcels.index, "global_mean_brain_e scans")
+        values = pd.to_numeric(global_mean_brain_e.reindex(parcels.index), errors="raise").to_numpy(dtype=float)
+        reference = pd.DataFrame(np.repeat(values[:, None], parcels.shape[1], axis=1),
+                                 index=parcels.index, columns=parcels.columns)
+    else:
+        if not isinstance(parcel_mean_e, pd.DataFrame):
+            raise TypeError("parcel_mean requires parcel_mean_e as a pandas DataFrame")
+        _require_matching_labels(parcel_mean_e.index, parcels.index, "parcel_mean_e scans")
+        _require_matching_labels(parcel_mean_e.columns, parcels.columns, "parcel_mean_e parcels")
+        reference = parcel_mean_e.reindex(index=parcels.index, columns=parcels.columns).astype(float).copy()
+    reference_values = reference.to_numpy(dtype=float)
+    if not np.isfinite(reference_values).all() or (reference_values < 0).any():
+        raise ValueError("Demeaning reference must contain finite, nonnegative raw E values")
+    demeaned = parcels - reference
+    values = demeaned.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("Demeaned PCA input contains non-finite values")
+    total_variance = demeaned.var(axis=0, ddof=1).sum()
+    if not np.isfinite(total_variance) or total_variance <= 0:
+        raise ValueError("Demeaned parcel profiles have no finite positive between-scan variance")
+    model = PCA(svd_solver="full")
+    score_values = model.fit_transform(values)
+    names = [f"PC{i + 1}" for i in range(score_values.shape[1])]
+    scores = pd.DataFrame(score_values, index=parcels.index.copy(), columns=names)
+    scores.index.name = parcels.index.name or "subjid"
+    loadings = pd.DataFrame(model.components_.T, index=parcels.columns.copy(), columns=names)
+    loadings.index.name = parcels.columns.name or "parcel"
+    variance = pd.DataFrame({"explained_variance": model.explained_variance_,
+                             "explained_variance_ratio": model.explained_variance_ratio_,
+                             "cumulative_variance_ratio": np.cumsum(model.explained_variance_ratio_)},
+                            index=pd.Index(names, name="component"))
+    return DemeanedParcelPCA(parcels, reference, demeaned, demean_by, scores, loadings, variance, model)
+
+
+def _require_matching_labels(actual: pd.Index, expected: pd.Index, label: str) -> None:
+    """Allow reordering but never duplicate, discard, or invent labels."""
+    if actual.has_duplicates:
+        raise ValueError(f"Duplicate labels in {label}: {actual[actual.duplicated()].tolist()}")
+    missing, extra = expected.difference(actual).tolist(), actual.difference(expected).tolist()
+    if missing or extra:
+        raise ValueError(f"Mismatched {label}: missing={missing}, extra={extra}")
 
 
 def calculate_parcel_p95(
@@ -178,7 +288,7 @@ def build_parcel_p95_matrix(subject_statistics: Sequence[pd.Series]) -> pd.DataF
 
 def fit_parcel_pca(
     parcel_p95: pd.DataFrame,
-    global_p95_e: pd.Series,
+    global_p95_e: pd.Series | None = None,
 ) -> ParcelPCA:
     """Normalize parcel P95 values, apply global-P95 weights, and fit PCA.
 
@@ -193,10 +303,13 @@ def fit_parcel_pca(
 
     Parcels are not variance-standardized. Scikit-learn centers each parcel
     across scans as part of fitting PCA.
+    Omitting global_p95_e restores the original normalized/demeaned pipeline;
+    supplying it preserves the existing global-P95-weighted calculation.
     """
     _validate_subject_parcel_frame(parcel_p95)
     parcel_p95 = parcel_p95.astype(float).copy()
-    global_p95_e = _validate_global_p95_e(global_p95_e, parcel_p95.index)
+    if global_p95_e is not None:
+        global_p95_e = _validate_global_p95_e(global_p95_e, parcel_p95.index)
 
     global_mean_e = parcel_p95.mean(axis=1).rename("global_mean_E")
 
@@ -214,7 +327,7 @@ def fit_parcel_pca(
     if not np.allclose(subject_demeaned.mean(axis=1), 0.0, atol=1e-12):
         raise RuntimeError("Within-scan parcel demeaning failed")
 
-    global_p95_weighted = subject_demeaned.mul(global_p95_e, axis="index")
+    global_p95_weighted = subject_demeaned.copy() if global_p95_e is None else subject_demeaned.mul(global_p95_e, axis="index")
 
     if not np.isfinite(global_p95_weighted.to_numpy(dtype=float)).all():
         raise ValueError("Global-P95-weighted PCA matrix contains non-finite values")
@@ -268,7 +381,7 @@ def fit_parcel_pca(
     )
 
 
-def components_for_variance(pca_result: ParcelPCA, threshold: float) -> int:
+def components_for_variance(pca_result: ParcelPCA | DemeanedParcelPCA, threshold: float) -> int:
     """Return the smallest number of PCs reaching a cumulative threshold."""
     if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
         raise TypeError("threshold must be numeric")
@@ -288,7 +401,7 @@ def components_for_variance(pca_result: ParcelPCA, threshold: float) -> int:
 
 def global_and_pc_predictors(
     global_metrics: pd.DataFrame,
-    pca_result: ParcelPCA,
+    pca_result: ParcelPCA | DemeanedParcelPCA,
     *,
     n_pcs: int,
 ) -> pd.DataFrame:
@@ -482,7 +595,7 @@ def expand_predictors_to_courses(
 
 
 def plot_pca_variance(
-    pca_result: ParcelPCA,
+    pca_result: ParcelPCA | DemeanedParcelPCA,
     thresholds: Sequence[float] = (0.96, 0.99),
 ) -> tuple[Figure, np.ndarray]:
     """Plot component-wise and cumulative explained variance."""
@@ -626,10 +739,10 @@ def plot_global_outcome(
 
 
 def plot_subject_parcel_heatmap(
-    pca_result: ParcelPCA,
+    pca_result: ParcelPCA | DemeanedParcelPCA,
 ) -> tuple[Figure, Axes]:
-    """Plot the global-P95-weighted matrix supplied to PCA."""
-    matrix = pca_result.global_p95_weighted_parcels
+    """Plot the actual matrix supplied to PCA, with its transformation label."""
+    matrix = pca_result.pca_input
     width = min(20, max(8, matrix.shape[1] * 0.08))
     height = min(14, max(4, matrix.shape[0] * 0.18))
 
@@ -648,7 +761,7 @@ def plot_subject_parcel_heatmap(
     ax.set(
         xlabel="Parcel",
         ylabel="Modeled scan",
-        title="PCA input: relative P95 E weighted by global brain P95 E",
+        title=f"PCA input: {pca_result.input_label}",
     )
     ax.set_yticks(np.arange(len(matrix)), labels=matrix.index)
 
@@ -665,14 +778,14 @@ def plot_subject_parcel_heatmap(
     fig.colorbar(
         image,
         ax=ax,
-        label="Demeaned relative parcel P95 E × global brain P95 E",
+        label=pca_result.input_label,
     )
 
     return fig, ax
 
 
 def plot_top_loadings(
-    pca_result: ParcelPCA,
+    pca_result: ParcelPCA | DemeanedParcelPCA,
     *,
     components: Sequence[str] = ("PC1", "PC2", "PC3"),
     n_parcels: int = 15,
