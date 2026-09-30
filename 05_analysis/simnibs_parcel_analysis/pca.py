@@ -71,7 +71,6 @@ class DemeanedParcelPCA:
     def input_label(self) -> str:
         return DEMEAN_DESCRIPTIONS[self.demean_by]
 
-
 def fit_demeaned_parcel_pca(
     parcel_p95: pd.DataFrame,
     *,
