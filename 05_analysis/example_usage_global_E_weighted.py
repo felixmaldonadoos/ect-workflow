@@ -9,6 +9,7 @@ from typing import Literal, Mapping, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
+import warnings
 import pandas as pd
 
 from simnibs_parcel_analysis import (
@@ -209,6 +210,12 @@ def combine_parcel_summaries(summaries: Sequence[ParcelSummary]) -> ParcelSummar
     )
 
 
+import warnings
+from pathlib import Path
+from typing import Sequence
+
+import numpy as np
+import pandas as pd
 
 
 def build_global_e_statistics(
@@ -219,164 +226,120 @@ def build_global_e_statistics(
     brain_tags: Sequence[int] = (1, 2),
     percentile: float = 95.0,
     simulation_ids: Sequence[str] | None = None,
+    negative_atol: float = 1e-8,
 ) -> pd.DataFrame:
-    """Calculate ordinary P95 and arithmetic mean E over selected brain tetrahedra."""
+    """Calculate unweighted percentile and mean magnitude over selected brain tetrahedra.
+
+    The field and negative_atol are assumed to use V/m. Validate only selected
+    tetrahedra; warn and zero values in [-negative_atol, 0) in a working copy.
+    Original mesh fields and HDF5 files remain unchanged.
+    """
     import simnibs
 
-    hdf5_files = [Path(path) for path in hdf5_files]
-
-    if not hdf5_files:
-        raise ValueError("hdf5_files is empty")
-
-    if isinstance(percentile, bool) or not isinstance(
-        percentile,
-        (int, float, np.integer, np.floating),
-    ):
-        raise TypeError("percentile must be numeric")
+    for name, value in (("percentile", percentile), ("negative_atol", negative_atol)):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, float, np.integer, np.floating)
+        ):
+            raise TypeError(f"{name} must be numeric")
+        if not np.isfinite(value):
+            raise ValueError(f"{name} must be finite")
 
     if not 0 <= percentile <= 100:
-        raise ValueError(
-            f"percentile must be between 0 and 100, got {percentile}"
-        )
+        raise ValueError(f"percentile must be between 0 and 100, got {percentile}")
+    if negative_atol < 0:
+        raise ValueError("negative_atol must be nonnegative")
 
+    brain_tags = tuple(brain_tags)
     if not brain_tags:
         raise ValueError("brain_tags cannot be empty")
+    if any(
+        isinstance(tag, (bool, np.bool_)) or not isinstance(tag, (int, np.integer))
+        for tag in brain_tags
+    ):
+        raise TypeError("brain_tags must contain integers")
 
-    brain_tags = tuple(int(tag) for tag in brain_tags)
     inventory = build_hdf5_inventory(hdf5_files, simulation_ids=simulation_ids)
     key = "simulation_id" if simulation_ids is not None else "subjid"
-    subject_ids = inventory[key].tolist()
-
     global_p95_values = {}
     global_mean_values = {}
 
-    for subject_id, hdf5_file in zip(
-        subject_ids,
-        hdf5_files,
-        strict=True,
-    ):
-        if not hdf5_file.is_file():
-            raise FileNotFoundError(
-                f"HDF5 file does not exist: {hdf5_file}"
-            )
+    for subject_id, hdf5_file in inventory[[key, "hdf5_file"]].itertuples(index=False, name=None):
+        mesh = simnibs.Msh.read_hdf5(str(hdf5_file), mesh_key)
 
-        mesh = simnibs.Msh.read_hdf5(
-            str(hdf5_file),
-            mesh_key,
-        )
-
-        if field_name not in mesh.field:
-            available = sorted(mesh.field.keys())
+        matches = [item for item in mesh.elmdata if item.field_name == field_name]
+        if not matches:
+            available = sorted(item.field_name for item in mesh.elmdata)
             raise KeyError(
-                f"Field {field_name!r} was not found for {subject_id}; "
-                f"available fields: {available}"
+                f"Element field {field_name!r} missing for {subject_id}; available: {available}"
+            )
+        if len(matches) != 1:
+            raise ValueError(f"Multiple element fields named {field_name!r} for {subject_id}")
+
+        field = np.asarray(matches[0].value, dtype=float)
+        if field.ndim == 2 and field.shape[1] == 1:
+            field = field[:, 0]
+
+        expected_shape = (mesh.elm.nr,)
+        if field.shape != expected_shape:
+            raise ValueError(
+                f"Field {field_name!r} must have shape {expected_shape} "
+                f"for {subject_id}; got {field.shape}"
             )
 
-        element_field_names = {
-            field.field_name
-            for field in mesh.elmdata
-        }
-
-        if field_name not in element_field_names:
+        element_tags = np.asarray(mesh.elm.tag1)
+        element_types = np.asarray(mesh.elm.elm_type)
+        if element_tags.shape != expected_shape or element_types.shape != expected_shape:
             raise ValueError(
-                f"Field {field_name!r} must be ElementData for {subject_id}"
-            )
-
-        field = np.asarray(
-            mesh.field[field_name].value,
-            dtype=float,
-        ).squeeze()
-
-        if field.ndim != 1:
-            raise ValueError(
-                f"Field {field_name!r} must be scalar for {subject_id}, "
-                f"got shape {field.shape}"
-            )
-
-        if field.size != mesh.elm.nr:
-            raise ValueError(
-                f"Field {field_name!r} contains {field.size} values, "
-                f"but mesh.elm.nr is {mesh.elm.nr} for {subject_id}"
-            )
-
-        if not np.isfinite(field).all():
-            raise ValueError(
-                f"Field {field_name!r} contains non-finite values "
-                f"for {subject_id}"
-            )
-
-        if (field < 0).any():
-            raise ValueError(
-                f"Field {field_name!r} contains negative values "
-                f"for {subject_id}"
-            )
-
-        element_tags = np.asarray(
-            mesh.elm.tag1,
-            dtype=int,
-        ).squeeze()
-        element_types = np.asarray(
-            mesh.elm.elm_type,
-            dtype=int,
-        ).squeeze()
-
-        if element_tags.ndim != 1 or element_tags.size != field.size:
-            raise ValueError(
-                f"Element tags have shape {element_tags.shape}; "
-                f"expected ({field.size},) for {subject_id}"
-            )
-
-        if element_types.ndim != 1 or element_types.size != field.size:
-            raise ValueError(
-                f"Element types have shape {element_types.shape}; "
-                f"expected ({field.size},) for {subject_id}"
+                f"Element tags and types must have shape {expected_shape} for {subject_id}"
             )
 
         tetrahedron_mask = element_types == 4
-        brain_mask = tetrahedron_mask & np.isin(
-            element_tags,
-            brain_tags,
-        )
+        brain_mask = tetrahedron_mask & np.isin(element_tags, brain_tags)
 
         if not brain_mask.any():
-            available_tags = np.unique(
-                element_tags[tetrahedron_mask]
-            ).tolist()
-
+            available_tags = np.unique(element_tags[tetrahedron_mask]).tolist()
             raise ValueError(
-                f"No tetrahedra with brain tags {list(brain_tags)} "
-                f"were found for {subject_id}; available tetrahedral "
-                f"tags: {available_tags}"
+                f"No tetrahedra with brain tags {list(brain_tags)} for {subject_id}; "
+                f"available tetrahedral tags: {available_tags}"
             )
 
-        brain_field = field[brain_mask]
+        brain_field = field[brain_mask]  # Boolean indexing creates a working copy.
+
+        if not np.isfinite(brain_field).all():
+            raise ValueError(
+                f"Brain field {field_name!r} contains nonfinite values for {subject_id}"
+            )
+
+        invalid = brain_field < -negative_atol
+        if invalid.any():
+            raise ValueError(
+                f"Brain field {field_name!r} contains {invalid.sum()} values below "
+                f"-{negative_atol:g} V/m for {subject_id}; minimum={brain_field.min():.8g} V/m"
+            )
+
+        negative = brain_field < 0
+        if negative.any():
+            warnings.warn(
+                f"Brain field {field_name!r} for {subject_id}: setting {negative.sum()} "
+                f"negligible negatives to zero; minimum={brain_field.min():.8g} V/m",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            brain_field[negative] = 0.0
+
         global_mean_values[subject_id] = float(brain_field.mean())
-
-        global_p95_values[subject_id] = float(
-            np.percentile(
-                brain_field,
-                percentile,
-            )
-        )
+        global_p95_values[subject_id] = float(np.percentile(brain_field, percentile))
 
         print(
-            f"{subject_id}: "
-            f"global P{percentile:g} E = "
-            f"{global_p95_values[subject_id]:.6g}; "
+            f"{subject_id}: global P{percentile:g} E = {global_p95_values[subject_id]:.6g}; "
             f"brain tetrahedra = {brain_field.size}"
         )
 
-    global_p95_e = pd.Series(
-        global_p95_values,
-        name=f"global_p{percentile:g}_E",
-        dtype=float,
-    )
-    global_p95_e.index.name = key
-
+    global_p95_e = pd.Series(global_p95_values, name=f"global_p{percentile:g}_E", dtype=float)
     global_mean_e = pd.Series(global_mean_values, name="global_mean_brain_E", dtype=float)
-    global_mean_e.index.name = key
-    return pd.concat([global_p95_e, global_mean_e], axis=1)
-
+    result = pd.concat([global_p95_e, global_mean_e], axis=1)
+    result.index.name = key
+    return result
 
 def build_global_p95_e(
     hdf5_files: Sequence[str | Path],
