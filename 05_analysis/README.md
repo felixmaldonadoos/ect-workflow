@@ -92,17 +92,79 @@ identifier. A treatment course is uniquely identified by
 CGI changes. Two clinical rows with the same base ID and `date_start` are a
 conflict and stop the analysis.
 
-PCA remains scans × parcels. For outcome correlations, every modeled scan is
-matched to every treatment course sharing its `subjid_base`, producing a unique
-`observation_id = modeled scan + course start date`. The current Pearson
-correlations treat these scan-course rows as independent. Because scans and
-courses repeat within people, those p-values and ordinary Fisher intervals are
-descriptive; clustered or mixed-effects inference should replace them in the
-final inferential model.
+The pooled runner (`run_pca_weighted_global_E_job_synthsr.py`) reads the
+`stimulus` sheet of the same cognitive-score workbook and selects the modal
+placement separately for each `(subjid_base, series_num)`:
 
-A modeled scan whose `subjid_base` has no complete treatment course is retained
-in the ROI summaries and PCA, but excluded from outcome correlations with an
-explicit warning listing the affected scans and base IDs.
+Before selection, the acute-analysis path explicitly excludes rows whose
+`series_num` is below 1 or is not a finite integer. This removes maintenance
+sessions (`series_num=0`), negative/fractional values, missing values, and
+nonnumeric labels. Numeric strings such as `"1"` and integer-valued floats
+such as `1.0` are accepted. The excluded count and original rows are printed;
+no course numbers are inferred, filled, or rounded. Filtering occurs before
+session/date/placement validation, and an empty acute table is an error.
+Direct `load_ect_sessions()` calls remain strict unless `acute_only=True` is
+requested; both acute course-mode functions apply this filter automatically.
+
+1. Match a complete CGI course to `series_num` in the outcome sheet when
+   supplied. Otherwise, require exactly one stimulus series with sessions in
+   the inclusive `date_start`–`date_end (acute)` interval. Missing matches,
+   overlapping series, or two clinical courses assigned to one series fail.
+2. For matched acute courses, count only sessions inside that date interval;
+   maintenance sessions outside it do not determine the acute-course mode.
+   Stimulus series without an eligible CGI course use all their sessions and
+   remain eligible for ROI/PCA, without an outcome.
+3. Count each session once. Normalize placement whitespace and case; ignore
+   blank/missing/literal `nan` placements with a warning and exported counts.
+   Ties, entirely unknown placements, invalid labels, and duplicate sessions
+   fail explicitly. `frequency_hz="age"` is preserved and does not affect this
+   selection. This step does not scale E-fields by dose.
+4. Match the winning placement to the selected model type and static/adaptive
+   step in the query CSV. Nonmodal simulations are not needed. Multiple runs,
+   datasets, or files for the selected scan/placement remain errors; restrict
+   the query export instead of choosing one arbitrarily.
+
+The earlier session-to-HDF5 mapping rules still apply: one candidate scan is
+selected automatically, while multiple scans for a patient require an explicit
+`--subject-scan-map` JSON file, e.g. `{"subj-cat-001": "subj-cat-001-001"}`.
+This file is distinct from `SUBJECT_MAP`, which maps scans to FreeSurfer
+reconstructions. Neither `series_num` nor `session_num` implies a scan suffix.
+BL and BT remain distinct unless explicitly requested with
+`--placement-alias BT=BL`; aliases apply after counting clinical placements.
+
+Each unique selected HDF5 supplies one PCA row, indexed by
+`simulation_id = dataset_root::modeled_subjid::placement`. Thus one scan can
+supply RUL for one course and BT for another. Courses reusing the same HDF5
+reuse its predictor row; that field is not duplicated in PCA. Canonical
+`subjid` and `subjid_base` remain available in the metadata. Outcomes join only
+the explicitly assigned field, never every scan/placement for that patient.
+
+The runner exports `selected_hdf5_inventory.csv` and
+`course_hdf5_mapping.csv`, including series, course ID, counting window, modal
+counts/fraction, clinical and simulated placement, selected scan, and path.
+Use `--selection-only` to generate these tables in `selection_preview/`
+without fitting PCA or changing the selection tables for an existing run:
+
+```bash
+python run_pca_weighted_global_E_job_synthsr.py \
+    --model-type skin_double --analysis-mode adaptive --selection-only
+
+# Add the scan map if multiple candidate scans exist for a patient.
+bash run_pca_array_submit.sh --subject-scan-map /path/to/subject_scan_map.json
+```
+
+The workbook and query paths remain configurable in the runner, or via
+`--cognitive-scores` and `--query-path`; `--stimulus-sheet` defaults to
+`stimulus`. The submission wrapper forwards these options and preserves its
+default of all three demeaning analyses. `--existing-only` disables only the
+added demeaning branches, not modal-placement selection.
+
+For direct all-atlas Python calls, pass `simulation_ids` in HDF5 order and
+`course_hdf5_map` from `select_modal_course_hdf5`. Older APIs without these
+arguments retain the legacy scan × course matching behavior. The current
+Pearson correlations still do not account for repeated courses within people;
+their p-values and ordinary Fisher intervals remain descriptive. Simulation,
+scan, course, and patient counts are reported separately in the new path.
 # Optional raw-E demeaning analyses
 
 The existing spatially weighted/unweighted parcel-P95 analyses, global-E
@@ -191,8 +253,8 @@ Compatibility: `fit_parcel_pca(parcel_p95, global_p95_e)` keeps its existing
 formula. The older one-argument call now works again and fits the original
 normalized, within-subject-demeaned matrix.
 
-Treatment-course matching is unchanged: scans still expand to all courses
-sharing the base ID. Correlation p-values and confidence intervals still use
+All preprocessing branches in the pooled runner use the same explicit
+course-to-HDF5 map described above. Correlation p-values and confidence intervals still use
 the existing Pearson implementation and do not account for dependence between
 repeated observations within people. BH correction is
 within each atlas/P95/preprocessing run, not across all added analyses.

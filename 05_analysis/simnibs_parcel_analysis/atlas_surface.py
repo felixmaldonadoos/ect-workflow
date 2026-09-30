@@ -49,6 +49,7 @@ def build_surface_roi_summary(
     surface_files: Sequence[str | Path] | None = None,
     surface_relative_path: str | Path = "fsavg_overlays/tdcs_uq_gpc_fsavg.msh",
     subject_ids: Sequence[str] | None = None,
+    simulation_ids: Sequence[str] | None = None,
     field_name: str = "magnE_mean",
     percentile: float = 95,
     min_nodes_per_roi: int = 20,
@@ -62,7 +63,7 @@ def build_surface_roi_summary(
     """
     if atlas_name not in SURFACE_ATLASES:
         raise ValueError(f"atlas_name must be one of {sorted(SURFACE_ATLASES)}")
-    scans = build_hdf5_inventory(hdf5_files, subject_ids=subject_ids, require_files=True)
+    scans = build_hdf5_inventory(hdf5_files, subject_ids=subject_ids, simulation_ids=simulation_ids, require_files=True)
     if surface_files is None:
         resolved_surface_files = [fsaverage_surface_path(path, relative_path=surface_relative_path) for path in scans["hdf5_file"]]
     else:

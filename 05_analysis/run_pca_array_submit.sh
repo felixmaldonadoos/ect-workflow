@@ -18,22 +18,54 @@ if [[ ! "$ARRAY_TASKS" =~ ^[0-3](-[0-3])?(,[0-3](-[0-3])?)*(%[1-9][0-9]*)?$ ]]; 
     exit 2
 fi
 
-if (( $# == 0 )); then
-    analysis_args=(--demean-by brain_mean parcel_p95_mean parcel_mean)
-elif [[ "$1" == "--existing-only" && $# == 1 ]]; then
-    analysis_args=()
-elif [[ "$1" == "--demean-by" && $# -ge 2 ]]; then
-    for reference in "${@:2}"; do
-        case "$reference" in
-            brain_mean|parcel_p95_mean|parcel_mean) ;;
-            *) echo "Invalid demeaning reference: $reference" >&2; exit 2 ;;
-        esac
-    done
-    analysis_args=("$@")
-else
-    echo "Usage: $0 [--demean-by MODE ... | --existing-only]" >&2
-    exit 2
-fi
+demean_args=(--demean-by brain_mean parcel_p95_mean parcel_mean)
+extra_args=()
+demean_set=0
+while (( $# )); do
+    case "$1" in
+        --existing-only|--demean-by)
+            if (( demean_set )); then
+                echo "Choose --existing-only or --demean-by once." >&2; exit 2
+            fi
+            demean_set=1
+            option="$1"
+            shift
+            demean_args=()
+            if [[ "$option" == "--demean-by" ]]; then
+                demean_args=(--demean-by)
+                while (( $# )) && [[ "$1" != --* ]]; do
+                    case "$1" in
+                        brain_mean|parcel_p95_mean|parcel_mean) demean_args+=("$1") ;;
+                        *) echo "Invalid demeaning reference: $1" >&2; exit 2 ;;
+                    esac
+                    shift
+                done
+                if (( ${#demean_args[@]} == 1 )); then
+                    echo "--demean-by requires at least one mode." >&2; exit 2
+                fi
+            fi
+            ;;
+        --subject-scan-map|--cognitive-scores|--stimulus-sheet|--query-path|--placement-alias)
+            if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
+                echo "$1 requires a value." >&2; exit 2
+            fi
+            value="$2"
+            case "$1" in
+                --subject-scan-map|--cognitive-scores|--query-path)
+                    if [[ ! -f "$value" || ! -r "$value" ]]; then
+                        echo "Required input file not found or unreadable: $value" >&2; exit 2
+                    fi
+                    value="$(realpath -e -- "$value")"
+                    ;;
+            esac
+            extra_args+=("$1" "$value")
+            shift 2
+            ;;
+        --selection-only) extra_args+=("$1"); shift ;;
+        *) echo "Unsupported argument: $1" >&2; exit 2 ;;
+    esac
+done
+analysis_args=("${demean_args[@]}" "${extra_args[@]}")
 
 for file in "$ARRAY_SCRIPT" "$SCRIPT_DIR/run_pca_weighted_global_E_job_synthsr.py"; do
     if [[ ! -r "$file" ]]; then

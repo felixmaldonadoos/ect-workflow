@@ -1,0 +1,1275 @@
+diff --git a/05_analysis/README.md b/05_analysis/README.md
+index 3427e6f..b3b10da 100644
+--- a/05_analysis/README.md
++++ b/05_analysis/README.md
+@@ -92,17 +92,69 @@ identifier. A treatment course is uniquely identified by
+ CGI changes. Two clinical rows with the same base ID and `date_start` are a
+ conflict and stop the analysis.
+ 
+-PCA remains scans × parcels. For outcome correlations, every modeled scan is
+-matched to every treatment course sharing its `subjid_base`, producing a unique
+-`observation_id = modeled scan + course start date`. The current Pearson
+-correlations treat these scan-course rows as independent. Because scans and
+-courses repeat within people, those p-values and ordinary Fisher intervals are
+-descriptive; clustered or mixed-effects inference should replace them in the
+-final inferential model.
+-
+-A modeled scan whose `subjid_base` has no complete treatment course is retained
+-in the ROI summaries and PCA, but excluded from outcome correlations with an
+-explicit warning listing the affected scans and base IDs.
++The pooled runner (`run_pca_weighted_global_E_job_synthsr.py`) reads the
++`stimulus` sheet of the same cognitive-score workbook and selects the modal
++placement separately for each `(subjid_base, series_num)`:
++
++1. Match a complete CGI course to `series_num` in the outcome sheet when
++   supplied. Otherwise, require exactly one stimulus series with sessions in
++   the inclusive `date_start`–`date_end (acute)` interval. Missing matches,
++   overlapping series, or two clinical courses assigned to one series fail.
++2. For matched acute courses, count only sessions inside that date interval;
++   maintenance sessions outside it do not determine the acute-course mode.
++   Stimulus series without an eligible CGI course use all their sessions and
++   remain eligible for ROI/PCA, without an outcome.
++3. Count each session once. Normalize placement whitespace and case; ignore
++   blank/missing/literal `nan` placements with a warning and exported counts.
++   Ties, entirely unknown placements, invalid labels, and duplicate sessions
++   fail explicitly. `frequency_hz="age"` is preserved and does not affect this
++   selection. This step does not scale E-fields by dose.
++4. Match the winning placement to the selected model type and static/adaptive
++   step in the query CSV. Nonmodal simulations are not needed. Multiple runs,
++   datasets, or files for the selected scan/placement remain errors; restrict
++   the query export instead of choosing one arbitrarily.
++
++The earlier session-to-HDF5 mapping rules still apply: one candidate scan is
++selected automatically, while multiple scans for a patient require an explicit
++`--subject-scan-map` JSON file, e.g. `{"subj-cat-001": "subj-cat-001-001"}`.
++This file is distinct from `SUBJECT_MAP`, which maps scans to FreeSurfer
++reconstructions. Neither `series_num` nor `session_num` implies a scan suffix.
++BL and BT remain distinct unless explicitly requested with
++`--placement-alias BT=BL`; aliases apply after counting clinical placements.
++
++Each unique selected HDF5 supplies one PCA row, indexed by
++`simulation_id = dataset_root::modeled_subjid::placement`. Thus one scan can
++supply RUL for one course and BT for another. Courses reusing the same HDF5
++reuse its predictor row; that field is not duplicated in PCA. Canonical
++`subjid` and `subjid_base` remain available in the metadata. Outcomes join only
++the explicitly assigned field, never every scan/placement for that patient.
++
++The runner exports `selected_hdf5_inventory.csv` and
++`course_hdf5_mapping.csv`, including series, course ID, counting window, modal
++counts/fraction, clinical and simulated placement, selected scan, and path.
++Use `--selection-only` to generate these tables in `selection_preview/`
++without fitting PCA or changing the selection tables for an existing run:
++
++```bash
++python run_pca_weighted_global_E_job_synthsr.py \
++    --model-type skin_double --analysis-mode adaptive --selection-only
++
++# Add the scan map if multiple candidate scans exist for a patient.
++bash run_pca_array_submit.sh --subject-scan-map /path/to/subject_scan_map.json
++```
++
++The workbook and query paths remain configurable in the runner, or via
++`--cognitive-scores` and `--query-path`; `--stimulus-sheet` defaults to
++`stimulus`. The submission wrapper forwards these options and preserves its
++default of all three demeaning analyses. `--existing-only` disables only the
++added demeaning branches, not modal-placement selection.
++
++For direct all-atlas Python calls, pass `simulation_ids` in HDF5 order and
++`course_hdf5_map` from `select_modal_course_hdf5`. Older APIs without these
++arguments retain the legacy scan × course matching behavior. The current
++Pearson correlations still do not account for repeated courses within people;
++their p-values and ordinary Fisher intervals remain descriptive. Simulation,
++scan, course, and patient counts are reported separately in the new path.
+ # Optional raw-E demeaning analyses
+ 
+ The existing spatially weighted/unweighted parcel-P95 analyses, global-E
+@@ -191,8 +243,8 @@ Compatibility: `fit_parcel_pca(parcel_p95, global_p95_e)` keeps its existing
+ formula. The older one-argument call now works again and fits the original
+ normalized, within-subject-demeaned matrix.
+ 
+-Treatment-course matching is unchanged: scans still expand to all courses
+-sharing the base ID. Correlation p-values and confidence intervals still use
++All preprocessing branches in the pooled runner use the same explicit
++course-to-HDF5 map described above. Correlation p-values and confidence intervals still use
+ the existing Pearson implementation and do not account for dependence between
+ repeated observations within people. BH correction is
+ within each atlas/P95/preprocessing run, not across all added analyses.
+diff --git a/05_analysis/example_usage_global_E_weighted.py b/05_analysis/example_usage_global_E_weighted.py
+index 32a81f2..96a8c17 100644
+--- a/05_analysis/example_usage_global_E_weighted.py
++++ b/05_analysis/example_usage_global_E_weighted.py
+@@ -20,6 +20,7 @@ from simnibs_parcel_analysis import (
+ )
+ from simnibs_parcel_analysis.clinical import prepare_scan_course_outcomes
+ from simnibs_parcel_analysis.identifiers import infer_subject_id
++from simnibs_parcel_analysis.mesh_io import build_hdf5_inventory
+ from simnibs_parcel_analysis.pca import (
+     DEMEAN_REFERENCES,
+     DemeanReference,
+@@ -163,12 +164,13 @@ def combine_parcel_summaries(summaries: Sequence[ParcelSummary]) -> ParcelSummar
+     scans = pd.concat([summary.scans for summary in summaries], ignore_index=True)
+     if "subjid" not in scans.columns:
+         raise KeyError("Combined scans table is missing 'subjid'")
+-    if scans["subjid"].duplicated().any():
+-        duplicates = scans.loc[scans["subjid"].duplicated(keep=False), "subjid"].unique().tolist()
+-        raise ValueError(f"Duplicate modeled-scan IDs in combined scans: {duplicates}")
++    key = "simulation_id" if "simulation_id" in scans else "subjid"
++    if scans[key].duplicated().any():
++        duplicates = scans.loc[scans[key].duplicated(keep=False), key].unique().tolist()
++        raise ValueError(f"Duplicate {key} values in combined scans: {duplicates}")
+ 
+-    matrix_ids = pd.Index(p95_unweighted.index.astype(str), name="subjid")
+-    scan_ids = pd.Index(scans["subjid"].astype(str), name="subjid")
++    matrix_ids = pd.Index(p95_unweighted.index.astype(str), name=key)
++    scan_ids = pd.Index(scans[key].astype(str), name=key)
+     missing_scans = matrix_ids.difference(scan_ids).tolist()
+     extra_scans = scan_ids.difference(matrix_ids).tolist()
+ 
+@@ -178,8 +180,8 @@ def combine_parcel_summaries(summaries: Sequence[ParcelSummary]) -> ParcelSummar
+             f"missing={missing_scans}, extra={extra_scans}"
+         )
+ 
+-    scans["subjid"] = scans["subjid"].astype(str)
+-    scans = scans.set_index("subjid", drop=False).loc[matrix_ids].reset_index(drop=True)
++    scans[key] = scans[key].astype(str)
++    scans = scans.set_index(key, drop=False).loc[matrix_ids].reset_index(drop=True)
+ 
+     qc_columns = first.qc.columns
+     for number, summary in enumerate(summaries[1:], start=2):
+@@ -216,6 +218,7 @@ def build_global_e_statistics(
+     mesh_key: str = "mesh_roi",
+     brain_tags: Sequence[int] = (1, 2),
+     percentile: float = 95.0,
++    simulation_ids: Sequence[str] | None = None,
+ ) -> pd.DataFrame:
+     """Calculate ordinary P95 and arithmetic mean E over selected brain tetrahedra."""
+     import simnibs
+@@ -240,18 +243,9 @@ def build_global_e_statistics(
+         raise ValueError("brain_tags cannot be empty")
+ 
+     brain_tags = tuple(int(tag) for tag in brain_tags)
+-    subject_ids = [infer_subject_id(path) for path in hdf5_files]
+-    subject_index = pd.Index(subject_ids, name="subjid")
+-
+-    if subject_index.has_duplicates:
+-        duplicates = (
+-            subject_index[
+-                subject_index.duplicated()
+-            ].unique().tolist()
+-        )
+-        raise ValueError(
+-            f"Duplicate modeled-scan IDs in hdf5_files: {duplicates}"
+-        )
++    inventory = build_hdf5_inventory(hdf5_files, simulation_ids=simulation_ids)
++    key = "simulation_id" if simulation_ids is not None else "subjid"
++    subject_ids = inventory[key].tolist()
+ 
+     global_p95_values = {}
+     global_mean_values = {}
+@@ -377,10 +371,10 @@ def build_global_e_statistics(
+         name=f"global_p{percentile:g}_E",
+         dtype=float,
+     )
+-    global_p95_e.index.name = "subjid"
++    global_p95_e.index.name = key
+ 
+     global_mean_e = pd.Series(global_mean_values, name="global_mean_brain_E", dtype=float)
+-    global_mean_e.index.name = "subjid"
++    global_mean_e.index.name = key
+     return pd.concat([global_p95_e, global_mean_e], axis=1)
+ 
+ 
+@@ -412,6 +406,7 @@ def run_global_p95_weighted_pca_outcome_analysis(
+     global_percentile: float = 95.0,
+     brain_tags: Sequence[int] = (1, 2),
+     exclude_roi_names: Sequence[str] = (),
++    course_hdf5_map: pd.DataFrame | None = None,
+ ) -> GlobalP95WeightedAnalysisResult:
+     """Run one atlas analysis using global-P95-weighted PCA."""
+     output_dir = Path(output_dir)
+@@ -425,6 +420,7 @@ def run_global_p95_weighted_pca_outcome_analysis(
+         summary.scans,
+         cognitive,
+         outcome_col=outcome_col,
++        course_hdf5_map=course_hdf5_map,
+     )
+ 
+     missing_global = parcel_values.index.difference(
+@@ -592,9 +588,10 @@ def run_global_p95_weighted_pca_outcome_analysis(
+             "treatment course; subjects may have multiple courses"
+         ),
+         "predictor_matching": (
+-            "each modeled scan is matched to every treatment course "
+-            "sharing subjid_base"
++            "explicit per-course modal-placement HDF5 assignment" if course_hdf5_map is not None
++            else "each modeled scan is matched to every treatment course sharing subjid_base"
+         ),
++        "pca_row_identity": "simulation_id" if course_hdf5_map is not None else "subjid",
+         "unmatched_scans": (
+             "retained in ROI/PCA outputs and excluded from "
+             "outcome correlations"
+@@ -771,6 +768,8 @@ def run_all_atlases_global_p95_weighted(
+     exclude_volume_rois_by_atlas: Mapping[str, Sequence[str]] | None = None,
+     min_volume_elements_per_roi: int = 10,
+     demean_references: Sequence[DemeanReference] = (),
++    simulation_ids: Sequence[str] | None = None,
++    course_hdf5_map: pd.DataFrame | None = None,
+ ) -> dict[str, GlobalP95WeightedAnalysisResult | AnalysisResult]:
+     
+     """Run the existing analyses and optionally add separately exported demeaning modes."""
+@@ -795,6 +794,16 @@ def run_all_atlases_global_p95_weighted(
+         hdf5_files,
+         subjects_dir_by_hdf5,
+     )
++    if (simulation_ids is None) != (course_hdf5_map is None):
++        raise ValueError("simulation_ids and course_hdf5_map must be provided together")
++    if simulation_ids is not None:
++        validated = build_hdf5_inventory(hdf5_files, simulation_ids=simulation_ids)
++        simulation_ids = validated["simulation_id"].tolist()
++    id_by_path = dict(zip(hdf5_files, simulation_ids, strict=True)) if simulation_ids is not None else None
++    if subject_map is not None:
++        unknown = sorted(set(subject_map).difference(infer_subject_id(path) for path in hdf5_files))
++        if unknown:
++            raise ValueError(f"subject_map contains modeled IDs absent from selected HDF5s: {unknown}")
+ 
+     if outcome_col not in cognitive.columns:
+         cognitive = compute_cgi_change(
+@@ -826,6 +835,11 @@ def run_all_atlases_global_p95_weighted(
+             "subjects_dir": [expected_subjects_dirs[str(path)] for path in hdf5_files],
+         }
+     )
++    if simulation_ids is not None:
++        input_sources["simulation_id"] = simulation_ids
++        # Validate all joins before loading expensive meshes or writing analyses.
++        prepare_scan_course_outcomes(input_sources, cognitive, outcome_col=outcome_col, course_hdf5_map=course_hdf5_map)
++        course_hdf5_map.to_csv(output_dir / "course_hdf5_mapping.csv", index=False)
+ 
+     input_sources.to_csv(
+         output_dir / "model_input_sources.csv",
+@@ -846,6 +860,7 @@ def run_all_atlases_global_p95_weighted(
+         mesh_key=mesh_key,
+         brain_tags=brain_tags,
+         percentile=global_percentile,
++        simulation_ids=simulation_ids,
+     )
+     global_p95_e = global_statistics[f"global_p{global_percentile:g}_E"]
+     global_mean_brain_e = global_statistics["global_mean_brain_E"]
+@@ -864,6 +879,7 @@ def run_all_atlases_global_p95_weighted(
+                     p95_method=method, outcome_col=outcome_col, demean_by=reference,
+                     global_mean_brain_e=global_mean_brain_e, brain_tags=brain_tags, field_name=field_name,
+                     variance_thresholds=(0.96, 0.97, 0.98, 0.99), pc_correlation_threshold=0.96,
++                    course_hdf5_map=course_hdf5_map,
+                 )
+ 
+     for atlas_name in volume_atlas_names:
+@@ -883,7 +899,10 @@ def run_all_atlases_global_p95_weighted(
+                     source_hdf5_files,
+                     subjects_dir,
+                     atlas_name=atlas_name,
+-                    subject_map=subject_map,
++                    subject_map=({key: value for key, value in subject_map.items()
++                                  if key in {infer_subject_id(path) for path in source_hdf5_files}}
++                                 if subject_map is not None else None),
++                    simulation_ids=[id_by_path[path] for path in source_hdf5_files] if id_by_path is not None else None,
+                     freesurfer_lut=freesurfer_lut,
+                     field_name=field_name,
+                     mesh_key=mesh_key,
+@@ -913,6 +932,7 @@ def run_all_atlases_global_p95_weighted(
+             global_percentile=global_percentile,
+             brain_tags=brain_tags,
+             exclude_roi_names=exclude_roi_names,
++            course_hdf5_map=course_hdf5_map,
+         )
+ 
+         if run_unweighted_sensitivity:
+@@ -932,6 +952,7 @@ def run_all_atlases_global_p95_weighted(
+                 global_percentile=global_percentile,
+                 brain_tags=brain_tags,
+                 exclude_roi_names=exclude_roi_names,
++                course_hdf5_map=course_hdf5_map,
+             )
+ 
+         add_demeaned_analyses(summary, f"volume_{atlas_name}", output_dir / f"volume_{atlas_name}")
+@@ -939,6 +960,7 @@ def run_all_atlases_global_p95_weighted(
+     if include_surface_hcp:
+         hcp_summary = build_surface_roi_summary(
+             hdf5_files,
++            simulation_ids=simulation_ids,
+             atlas_name="HCP_MMP1",
+             field_name=field_name,
+             percentile=95,
+@@ -960,6 +982,7 @@ def run_all_atlases_global_p95_weighted(
+             pc_correlation_threshold=0.96,
+             global_percentile=global_percentile,
+             brain_tags=brain_tags,
++            course_hdf5_map=course_hdf5_map,
+         )
+ 
+         if run_unweighted_sensitivity:
+@@ -978,6 +1001,7 @@ def run_all_atlases_global_p95_weighted(
+                 pc_correlation_threshold=0.96,
+                 global_percentile=global_percentile,
+                 brain_tags=brain_tags,
++                course_hdf5_map=course_hdf5_map,
+             )
+ 
+         add_demeaned_analyses(hcp_summary, "surface_HCP_MMP1", output_dir / "surface_HCP_MMP1")
+diff --git a/05_analysis/run_pca_array_submit.sh b/05_analysis/run_pca_array_submit.sh
+index c2c9228..1421455 100644
+--- a/05_analysis/run_pca_array_submit.sh
++++ b/05_analysis/run_pca_array_submit.sh
+@@ -18,22 +18,54 @@ if [[ ! "$ARRAY_TASKS" =~ ^[0-3](-[0-3])?(,[0-3](-[0-3])?)*(%[1-9][0-9]*)?$ ]];
+     exit 2
+ fi
+ 
+-if (( $# == 0 )); then
+-    analysis_args=(--demean-by brain_mean parcel_p95_mean parcel_mean)
+-elif [[ "$1" == "--existing-only" && $# == 1 ]]; then
+-    analysis_args=()
+-elif [[ "$1" == "--demean-by" && $# -ge 2 ]]; then
+-    for reference in "${@:2}"; do
+-        case "$reference" in
+-            brain_mean|parcel_p95_mean|parcel_mean) ;;
+-            *) echo "Invalid demeaning reference: $reference" >&2; exit 2 ;;
+-        esac
+-    done
+-    analysis_args=("$@")
+-else
+-    echo "Usage: $0 [--demean-by MODE ... | --existing-only]" >&2
+-    exit 2
+-fi
++demean_args=(--demean-by brain_mean parcel_p95_mean parcel_mean)
++extra_args=()
++demean_set=0
++while (( $# )); do
++    case "$1" in
++        --existing-only|--demean-by)
++            if (( demean_set )); then
++                echo "Choose --existing-only or --demean-by once." >&2; exit 2
++            fi
++            demean_set=1
++            option="$1"
++            shift
++            demean_args=()
++            if [[ "$option" == "--demean-by" ]]; then
++                demean_args=(--demean-by)
++                while (( $# )) && [[ "$1" != --* ]]; do
++                    case "$1" in
++                        brain_mean|parcel_p95_mean|parcel_mean) demean_args+=("$1") ;;
++                        *) echo "Invalid demeaning reference: $1" >&2; exit 2 ;;
++                    esac
++                    shift
++                done
++                if (( ${#demean_args[@]} == 1 )); then
++                    echo "--demean-by requires at least one mode." >&2; exit 2
++                fi
++            fi
++            ;;
++        --subject-scan-map|--cognitive-scores|--stimulus-sheet|--query-path|--placement-alias)
++            if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
++                echo "$1 requires a value." >&2; exit 2
++            fi
++            value="$2"
++            case "$1" in
++                --subject-scan-map|--cognitive-scores|--query-path)
++                    if [[ ! -f "$value" || ! -r "$value" ]]; then
++                        echo "Required input file not found or unreadable: $value" >&2; exit 2
++                    fi
++                    value="$(realpath -e -- "$value")"
++                    ;;
++            esac
++            extra_args+=("$1" "$value")
++            shift 2
++            ;;
++        --selection-only) extra_args+=("$1"); shift ;;
++        *) echo "Unsupported argument: $1" >&2; exit 2 ;;
++    esac
++done
++analysis_args=("${demean_args[@]}" "${extra_args[@]}")
+ 
+ for file in "$ARRAY_SCRIPT" "$SCRIPT_DIR/run_pca_weighted_global_E_job_synthsr.py"; do
+     if [[ ! -r "$file" ]]; then
+diff --git a/05_analysis/run_pca_weighted_global_E_job_synthsr.py b/05_analysis/run_pca_weighted_global_E_job_synthsr.py
+index e676026..9f960e1 100644
+--- a/05_analysis/run_pca_weighted_global_E_job_synthsr.py
++++ b/05_analysis/run_pca_weighted_global_E_job_synthsr.py
+@@ -8,7 +8,8 @@ from typing import Mapping
+ import pandas as pd
+ 
+ from example_usage_global_E_weighted import run_all_atlases_global_p95_weighted
+-from simnibs_parcel_analysis.identifiers import infer_subject_id
++from simnibs_parcel_analysis.identifiers import add_subject_id_columns, infer_subject_id
++from simnibs_parcel_analysis.clinical import load_ect_sessions, load_hdf5_query, select_modal_course_hdf5
+ from simnibs_parcel_analysis.pca import DEMEAN_REFERENCES
+ import argparse
+ 
+@@ -24,6 +25,13 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--analysis-mode", choices=tuple(ANALYSIS_STEP_BY_MODE), required=True)
+     parser.add_argument("--demean-by", nargs="+", choices=DEMEAN_REFERENCES, default=(),
+                         help="Add these demeaning analyses alongside the existing weighted/unweighted results.")
++    parser.add_argument("--query-path", type=Path, default=QUERY_PATH)
++    parser.add_argument("--cognitive-scores", type=Path, default=COGNITIVE_SCORES_PATH)
++    parser.add_argument("--stimulus-sheet", default="stimulus")
++    parser.add_argument("--subject-scan-map", type=Path, help="JSON mapping base patient IDs to preferred modeled scans.")
++    parser.add_argument("--placement-alias", action="append", default=[], metavar="CLINICAL=SIMULATED",
++                        help="Explicit HDF5 placement alias, e.g. BT=BL; BL and BT are distinct by default.")
++    parser.add_argument("--selection-only", action="store_true", help="Export course/HDF5 selections without loading meshes or fitting PCA.")
+     return parser.parse_args()
+ 
+ QUERY_PATH = Path(
+@@ -103,13 +111,7 @@ def add_base_subjid(df: pd.DataFrame, source_col: str = "subjid") -> pd.DataFram
+             f"Empty subject IDs in column {source_col!r} at rows: {bad_rows}"
+         )
+ 
+-    df["subjid_base"] = df[source_col].str.replace(
+-        r"-\d{3}$",
+-        "",
+-        regex=True,
+-    )
+-
+-    return df
++    return add_subject_id_columns(df, source_col=source_col)
+ 
+ def load_cogscores_batch(filename: str | Path) -> pd.DataFrame:
+     """Load clinical treatment courses with complete CGI values."""
+@@ -177,13 +179,13 @@ def load_hdf5_inventory(
+     subjects_dirs: Mapping[str, Path],
+     model_type_dir: str,
+     step: str,) -> pd.DataFrame:
+-    """Select and validate one HDF5 file per modeled scan."""
++    """Load candidate HDF5s; course-mode selection resolves placements afterward."""
+     path = Path(filename)
+ 
+     if not path.is_file():
+         raise FileNotFoundError(f"Query-result file does not exist: {path}")
+ 
+-    query = pd.read_csv(path)
++    query = load_hdf5_query(path, model_type=model_type_dir, simulation_type=step)
+     required_columns = {
+         "dataset_root",
+         "model_type_dir",
+@@ -257,31 +259,6 @@ def load_hdf5_inventory(
+             f"from full_file_path:\n{mismatches.to_string(index=False)}"
+         )
+ 
+-    duplicate_subject_mask = selected["inferred_subjid"].duplicated(
+-        keep=False
+-    )
+-
+-    if duplicate_subject_mask.any():
+-        duplicates = selected.loc[
+-            duplicate_subject_mask,
+-            ["dataset_root", "inferred_subjid", "full_file_path"],
+-        ]
+-        raise ValueError(
+-            "Each modeled-scan ID must identify exactly one HDF5 file:\n"
+-            f"{duplicates.to_string(index=False)}"
+-        )
+-
+-    missing_files = sorted(
+-        full_file_path
+-        for full_file_path in selected["full_file_path"]
+-        if not Path(full_file_path).is_file()
+-    )
+-
+-    if missing_files:
+-        raise FileNotFoundError(
+-            f"Selected HDF5 files do not exist: {missing_files}"
+-        )
+-
+     return selected.sort_values(
+         ["dataset_root", "subject_dir", "full_file_path"]
+     ).reset_index(drop=True)
+@@ -309,7 +286,7 @@ def exclude_subject_results(
+     missing_subjids = sorted(set(subjids).difference(inventory[subject_col]))
+ 
+     if missing_subjids:
+-        raise ValueError(f"Subjects were not found in the inventory: {missing_subjids}")
++        print(f"Configured exclusions already absent from this inventory: {missing_subjids}")
+ 
+     excluded_mask = inventory[subject_col].isin(subjids)
+     filtered = inventory.loc[~excluded_mask].copy()
+@@ -325,6 +302,7 @@ def main() -> None:
+     """Load both sources and run one pooled analysis."""
+     args = parse_args()
+     analysis_step, query_path, output_dir = resolve_analysis_config(args.model_type, args.analysis_mode)
++    query_path = args.query_path
+ 
+     print(f"Model type: {args.model_type}")
+     print(f"Analysis mode: {args.analysis_mode}")
+@@ -332,7 +310,7 @@ def main() -> None:
+     print(f"Query table: {query_path}")
+     print(f"Output directory: {output_dir}")
+ 
+-    df_cog = load_cogscores_batch(COGNITIVE_SCORES_PATH)
++    df_cog = load_cogscores_batch(args.cognitive_scores)
+     inventory = load_hdf5_inventory(
+         query_path,
+         SUBJECTS_DIR_BY_DATASET,
+@@ -340,11 +318,32 @@ def main() -> None:
+         analysis_step,
+     )
+     inventory = exclude_subject_results(inventory, list(EXCLUDED_SUBJIDS))
+-
++    aliases = {}
++    for value in args.placement_alias:
++        parts = value.split("=")
++        if len(parts) != 2 or parts[0].strip().upper() in aliases:
++            raise ValueError(f"Invalid or duplicate --placement-alias: {value!r}; use CLINICAL=SIMULATED")
++        aliases[parts[0].strip().upper()] = parts[1].strip().upper()
++    sessions = load_ect_sessions(args.cognitive_scores, args.stimulus_sheet, allow_missing_placement=True)
++    candidate_count = len(inventory)
++    inventory, course_mapping = select_modal_course_hdf5(
++        sessions, inventory, df_cog, model_type=args.model_type, simulation_type=args.analysis_mode,
++        subject_scan_map=args.subject_scan_map, electrode_placement_map=aliases)
++    missing_files = [path for path in inventory["full_file_path"] if not Path(path).is_file()]
++    if missing_files:
++        raise FileNotFoundError(f"Selected HDF5 files do not exist: {missing_files}")
++    selection_dir = output_dir / "selection_preview" if args.selection_only else output_dir
++    selection_dir.mkdir(parents=True, exist_ok=True)
++    inventory.to_csv(selection_dir / "selected_hdf5_inventory.csv", index=False)
++    course_mapping.to_csv(selection_dir / "course_hdf5_mapping.csv", index=False)
++    print(f"Selected {len(inventory)} unique HDF5s from {candidate_count} candidates for {len(course_mapping)} stimulus courses")
++    print(course_mapping[["subjid_base", "series_num", "electrode_placement", "simulated_placement",
++                          "n_modal_sessions", "n_known_placements", "modeled_subjid"]].to_string(index=False))
++    if args.selection_only:
++        print(f"Selection tables saved in {selection_dir}")
++        return
+     validate_analysis_paths(output_dir)
+ 
+-    inventory.to_csv(output_dir / "selected_hdf5_inventory.csv", index=False)
+-
+     for dataset_root in SUBJECTS_DIR_BY_DATASET:
+         count = inventory["dataset_root"].eq(dataset_root).sum()
+         print(f"{dataset_root} {args.analysis_mode} HDF5 files: {count}")
+@@ -373,6 +372,8 @@ def main() -> None:
+         freesurfer_lut=FREESURFER_LUT,
+         exclude_volume_rois_by_atlas=EXCLUDE_VOLUME_ROIS_BY_ATLAS,
+         demean_references=args.demean_by,
++        simulation_ids=inventory["simulation_id"].tolist(),
++        course_hdf5_map=course_mapping,
+     )
+ 
+     dk = results["volume_aparc_weighted"]
+diff --git a/05_analysis/simnibs_parcel_analysis/__init__.py b/05_analysis/simnibs_parcel_analysis/__init__.py
+index ecfc726..eef529f 100644
+--- a/05_analysis/simnibs_parcel_analysis/__init__.py
++++ b/05_analysis/simnibs_parcel_analysis/__init__.py
+@@ -16,6 +16,9 @@ from .clinical import (
+     compute_cgi_change,
+     compute_ef_scaling_factor,
+     load_cognitive_scores,
++    load_ect_sessions,
++    modal_placements_by_course,
++    select_modal_course_hdf5,
+     load_stimulus,
+     load_subject_info,
+     prepare_scan_course_outcomes,
+@@ -91,6 +94,9 @@ __all__ = [
+     "global_metrics_from_parcels",
+     "inspect_hdf5_mesh",
+     "load_cognitive_scores",
++    "load_ect_sessions",
++    "modal_placements_by_course",
++    "select_modal_course_hdf5",
+     "load_hdf5_mesh",
+     "load_stimulus",
+     "load_subject_info",
+diff --git a/05_analysis/simnibs_parcel_analysis/atlas_surface.py b/05_analysis/simnibs_parcel_analysis/atlas_surface.py
+index d8885e8..c03a8cf 100644
+--- a/05_analysis/simnibs_parcel_analysis/atlas_surface.py
++++ b/05_analysis/simnibs_parcel_analysis/atlas_surface.py
+@@ -49,6 +49,7 @@ def build_surface_roi_summary(
+     surface_files: Sequence[str | Path] | None = None,
+     surface_relative_path: str | Path = "fsavg_overlays/tdcs_uq_gpc_fsavg.msh",
+     subject_ids: Sequence[str] | None = None,
++    simulation_ids: Sequence[str] | None = None,
+     field_name: str = "magnE_mean",
+     percentile: float = 95,
+     min_nodes_per_roi: int = 20,
+@@ -62,7 +63,7 @@ def build_surface_roi_summary(
+     """
+     if atlas_name not in SURFACE_ATLASES:
+         raise ValueError(f"atlas_name must be one of {sorted(SURFACE_ATLASES)}")
+-    scans = build_hdf5_inventory(hdf5_files, subject_ids=subject_ids, require_files=True)
++    scans = build_hdf5_inventory(hdf5_files, subject_ids=subject_ids, simulation_ids=simulation_ids, require_files=True)
+     if surface_files is None:
+         resolved_surface_files = [fsaverage_surface_path(path, relative_path=surface_relative_path) for path in scans["hdf5_file"]]
+     else:
+diff --git a/05_analysis/simnibs_parcel_analysis/atlas_volume.py b/05_analysis/simnibs_parcel_analysis/atlas_volume.py
+index d6bd048..df2969d 100644
+--- a/05_analysis/simnibs_parcel_analysis/atlas_volume.py
++++ b/05_analysis/simnibs_parcel_analysis/atlas_volume.py
+@@ -223,6 +223,7 @@ def build_volume_roi_summary(
+     *,
+     atlas_name: str = "aparc",
+     subject_ids: Sequence[str] | None = None,
++    simulation_ids: Sequence[str] | None = None,
+     subject_map: Mapping[str, str] | None = None,
+     field_name: str = "magnE_mean",
+     percentile: float = 95,
+@@ -241,7 +242,8 @@ def build_volume_roi_summary(
+ 
+     """Calculate anatomical parcel P95 values from HDF5 volume meshes."""
+     canonical = canonical_volume_atlas_name(atlas_name)
+-    scans = build_hdf5_inventory(hdf5_files, subject_ids=subject_ids, require_files=mesh_loader is None)
++    scans = build_hdf5_inventory(hdf5_files, subject_ids=subject_ids, simulation_ids=simulation_ids,
++                                 require_files=mesh_loader is None)
+     scans = resolve_freesurfer_subjects(scans, subjects_dir, subject_map=subject_map)
+     scans["atlas_file"] = [str(resolve_volume_atlas_path(path, canonical)) for path in scans["fs_subject_dir"]]
+     if lut is None:
+diff --git a/05_analysis/simnibs_parcel_analysis/clinical.py b/05_analysis/simnibs_parcel_analysis/clinical.py
+index 383c62e..51c8067 100644
+--- a/05_analysis/simnibs_parcel_analysis/clinical.py
++++ b/05_analysis/simnibs_parcel_analysis/clinical.py
+@@ -14,13 +14,15 @@ import pandas as pd
+ from .identifiers import add_subject_id_columns, base_subject_id, build_scan_table
+ 
+ 
+-def load_ect_sessions(fn: str | Path, sheet_name: str | int = "stimulus") -> pd.DataFrame:
++def load_ect_sessions(fn: str | Path, sheet_name: str | int = "stimulus", *, allow_missing_placement: bool = False) -> pd.DataFrame:
+     """Load one row per ECT session, preserving all clinical columns.
+ 
+     Validate only the session identity, date, and placement needed for matching.
+     Other treatment variables remain untouched, including a temporary ``age``
+     placeholder in frequency_hz. Session numbers need not restart at each series.
+     No CGI eligibility filter or electric-field scaling is applied.
++    allow_missing_placement is for course-mode summaries only; it retains
++    missing/blank/literal 'nan' placements for explicit counting and warnings.
+     """
+     path = _require_file(fn, "ECT-session file")
+     if path.suffix.lower() != ".xlsx":
+@@ -28,7 +30,8 @@ def load_ect_sessions(fn: str | Path, sheet_name: str | int = "stimulus") -> pd.
+     if isinstance(sheet_name, bool) or not isinstance(sheet_name, (str, int)):
+         raise TypeError("sheet_name must identify one sheet by name or integer index")
+     raw = pd.read_excel(path, sheet_name=sheet_name, header=None, keep_default_na=False, na_values=[""])
+-    return _validate_ect_sessions(_ect_table_from_header(raw, "ECT-session sheet"))
++    return _validate_ect_sessions(_ect_table_from_header(raw, "ECT-session sheet"),
++                                  allow_missing_placement=allow_missing_placement)
+ 
+ 
+ def load_hdf5_query(
+@@ -251,7 +254,7 @@ def _ect_check_placements(placements: pd.Series, label: str) -> None:
+         raise ValueError(f"{label} has invalid electrode placements: {placements.loc[invalid].to_dict()}")
+ 
+ 
+-def _validate_ect_sessions(df: pd.DataFrame) -> pd.DataFrame:
++def _validate_ect_sessions(df: pd.DataFrame, *, allow_missing_placement: bool = False) -> pd.DataFrame:
+     result = _ect_clean_columns(df, "ECT-session table")
+     required = ["subjid", "series_num", "session_num", "date", "electrode_placement"]
+     _require_columns(result, required, "ECT-session table")
+@@ -272,8 +275,13 @@ def _validate_ect_sessions(df: pd.DataFrame) -> pd.DataFrame:
+     result["date"] = pd.to_datetime(dates, format="mixed", errors="raise").dt.normalize()
+     if result["date"].isna().any():
+         raise ValueError(f"Invalid ECT-session dates at rows: {result.index[result['date'].isna()].tolist()}")
+-    result["electrode_placement"] = _ect_required_text(result, "electrode_placement", "ECT-session table").str.upper()
+-    _ect_check_placements(result["electrode_placement"], "ECT-session table")
++    placement = result["electrode_placement"].astype("string").str.strip().str.upper()
++    if allow_missing_placement:
++        placement = placement.mask(placement.isin(["", "NAN"]))
++        _ect_check_placements(placement.dropna(), "ECT-session table")
++    else:
++        _ect_check_placements(placement, "ECT-session table")
++    result["electrode_placement"] = placement
+     duplicate = result.duplicated(["subjid_base", "series_num", "session_num"], keep=False)
+     if duplicate.any():
+         details = result.loc[duplicate, ["subjid", "series_num", "session_num", "date"]].to_string()
+@@ -303,6 +311,185 @@ def _ect_placement_aliases(mapping: Mapping[str, str] | None) -> dict[str, str]:
+     return aliases
+ 
+ 
++def modal_placements_by_course(sessions: pd.DataFrame) -> pd.DataFrame:
++    """Count sessions per patient/series; require a unique modal placement.
++
++    Missing/blank/literal 'nan' placements are omitted from the count, with a
++    warning and exported counts. Invalid nonmissing placements, duplicate
++    sessions, ties, and series with no known placement are errors. BL and BT
++    remain distinct clinical labels. Other stimulus variables are not used.
++    """
++    sessions = _validate_ect_sessions(sessions, allow_missing_placement=True)
++    rows = []
++    for (base, series), group in sessions.groupby(["subjid_base", "series_num"], sort=True):
++        counts = group["electrode_placement"].value_counts()
++        if counts.empty:
++            raise ValueError(f"No known electrode placement for {base}, series_num={series}")
++        modes = sorted(counts.index[counts.eq(counts.max())].tolist())
++        if len(modes) != 1:
++            raise ValueError(f"Tied modal electrode placements for {base}, series_num={series}: {counts.to_dict()}")
++        missing = int(group["electrode_placement"].isna().sum())
++        if missing:
++            warnings.warn(f"Ignoring {missing} missing placements for {base}, series_num={series}",
++                          UserWarning, stacklevel=2)
++        rows.append({"subjid_base": base, "series_num": int(series), "electrode_placement": modes[0],
++                     "n_sessions": len(group), "n_known_placements": int(counts.sum()),
++                     "n_missing_placements": missing, "n_modal_sessions": int(counts.max()),
++                     "modal_fraction": float(counts.max() / counts.sum()),
++                     "placement_counts": json.dumps({key: int(counts[key]) for key in sorted(counts.index)}),
++                     "first_session_date": group["date"].min(), "last_session_date": group["date"].max()})
++    return pd.DataFrame(rows)
++
++
++def select_modal_course_hdf5(
++    sessions: pd.DataFrame,
++    inventory: pd.DataFrame,
++    cognitive: pd.DataFrame,
++    *,
++    model_type: Literal["skin_single", "skin_double"],
++    simulation_type: Literal["static", "adaptive", "step_0", "step_2"],
++    subject_scan_map: Mapping[str, str] | str | Path | None = None,
++    electrode_placement_map: Mapping[str, str] | None = None,
++    outcome_col: str = "cgi_change",
++) -> tuple[pd.DataFrame, pd.DataFrame]:
++    """Select one scan/placement per stimulus course, independent of CGI eligibility.
++
++    For complete clinical courses, match series_num explicitly when present;
++    otherwise require exactly one series with sessions in the inclusive acute
++    date interval. Count only sessions inside that interval. Other stimulus
++    series use all their sessions and remain eligible for ROI/PCA, without an
++    outcome. A series cannot silently represent two clinical courses.
++
++    The existing session mapper resolves scans (explicit map if ambiguous),
++    aliases, and HDF5 candidates. Nonmodal placements need no simulation.
++    Unique selected HDF5s enter PCA once even if reused by multiple courses.
++    """
++    query = load_hdf5_query(inventory, model_type=model_type, simulation_type=simulation_type)
++    bases = set(query["subjid_base"])
++    sessions = _validate_ect_sessions(sessions, allow_missing_placement=True)
++    sessions = sessions.loc[sessions["subjid_base"].isin(bases)].copy()
++    missing = sorted(bases.difference(sessions["subjid_base"]))
++    if missing:
++        raise ValueError(f"No stimulus sessions for modeled patients; cannot select a course placement: {missing}")
++    if outcome_col not in cognitive:
++        cognitive = compute_cgi_change(cognitive, outcome_col=outcome_col)
++    cognitive = validate_treatment_courses(cognitive, outcome_col=outcome_col)
++    cognitive = cognitive.loc[cognitive["subjid_base"].isin(bases)].copy()
++    _require_columns(cognitive, ["date_end (acute)"], "Cognitive-score table")
++    if cognitive["date_end (acute)"].lt(cognitive["date_start"]).any():
++        raise ValueError("Clinical acute end date precedes course start date")
++
++    sessions_by_base = {base: group for base, group in sessions.groupby("subjid_base")}
++    windows = {}
++    for _, course in cognitive.iterrows():
++        available = sessions_by_base[course["subjid_base"]]
++        during = available.loc[available["date"].between(course["date_start"], course["date_end (acute)"])]
++        candidates = sorted(during["series_num"].unique().tolist())
++        supplied_series = course.get("series_num", pd.NA)
++        if pd.notna(supplied_series) and str(supplied_series).strip():
++            number = pd.to_numeric(supplied_series, errors="raise")
++            if isinstance(supplied_series, (bool, np.bool_)) or not np.isfinite(number) or number < 1 or number % 1:
++                raise ValueError(f"Invalid clinical series_num for {course['treatment_course_id']}: {supplied_series!r}")
++            # Other series inside the same acute window are a clinical ambiguity,
++            # even if a series number was supplied in the outcome sheet.
++            if candidates != [int(number)]:
++                raise ValueError(f"Clinical series_num conflicts with stimulus dates for {course['treatment_course_id']}; "
++                                 f"series in acute interval: {candidates}")
++            series = int(number)
++        elif len(candidates) == 1:
++            series = candidates[0]
++        else:
++            raise ValueError(f"Expected exactly one stimulus series in acute interval for {course['treatment_course_id']}; "
++                             f"found {candidates}")
++        key = (course["subjid_base"], series)
++        if key in windows:
++            raise ValueError(f"Multiple clinical courses map to the same stimulus patient/series: {key}")
++        windows[key] = course
++
++    pieces, links = [], []
++    for key, group in sessions.groupby(["subjid_base", "series_num"], sort=True):
++        course = windows.get(key)
++        if course is not None:
++            group = group.loc[group["date"].between(course["date_start"], course["date_end (acute)"])].copy()
++        pieces.append(group)
++        links.append({"subjid_base": key[0], "series_num": key[1],
++                      "treatment_course_id": course["treatment_course_id"] if course is not None else pd.NA,
++                      "mode_scope": "acute_date_window" if course is not None else "full_stimulus_series",
++                      "date_start": course["date_start"] if course is not None else pd.NaT,
++                      "date_end (acute)": course["date_end (acute)"] if course is not None else pd.NaT})
++    counted = pd.concat(pieces, ignore_index=True)
++    modes = modal_placements_by_course(counted)
++    modes = modes.merge(pd.DataFrame(links), on=["subjid_base", "series_num"], validate="one_to_one")
++    # Use an actual session having the modal placement to call the existing
++    # strict mapper. Its date/session_num are not used to choose an MRI scan.
++    representatives = counted.merge(modes[["subjid_base", "series_num", "electrode_placement"]],
++                                    on=["subjid_base", "series_num", "electrode_placement"], validate="many_to_one")
++    representatives = representatives.sort_values(["subjid_base", "series_num", "date", "session_num"])
++    representatives = representatives.drop_duplicates(["subjid_base", "series_num"])
++    mapped = map_sessions_to_hdf5(representatives, query, model_type=model_type, simulation_type=simulation_type,
++                                  subject_scan_map=subject_scan_map, electrode_placement_map=electrode_placement_map)
++    assignments = modes.merge(mapped[["subjid_base", "series_num", "modeled_subjid", "hdf5_fn"]],
++                              on=["subjid_base", "series_num"], validate="one_to_one")
++    selected = query.loc[query["hdf5_fn"].isin(assignments["hdf5_fn"])].copy()
++    if selected["hdf5_fn"].duplicated().any():
++        raise ValueError("Selected inventory contains repeated HDF5 paths")
++    # Model/step are fixed by this run; dataset + scan + placement distinguish
++    # alternative fields without changing canonical patient or scan IDs.
++    _require_columns(selected, ["dataset_root"], "HDF5 inventory")
++    selected["simulation_id"] = (selected["dataset_root"].astype(str) + "::" + selected["modeled_subjid"]
++                                  + "::" + selected["electrode_placement"])
++    if selected["simulation_id"].duplicated().any():
++        raise ValueError("Multiple selected HDF5s identify the same dataset/scan/placement")
++    assignments = assignments.merge(
++        selected[["hdf5_fn", "simulation_id", "dataset_root", "electrode_placement"]].rename(
++            columns={"electrode_placement": "simulated_placement"}), on="hdf5_fn", validate="many_to_one")
++    return selected.reset_index(drop=True), assignments.reset_index(drop=True)
++
++
++def prepare_mapped_course_outcomes(
++    scans: pd.DataFrame,
++    cognitive: pd.DataFrame,
++    course_hdf5_map: pd.DataFrame,
++    *,
++    outcome_col: str = "cgi_change",
++) -> pd.DataFrame:
++    """Join explicit simulation/course assignments without scan × course expansion."""
++    _require_columns(scans, ["subjid", "simulation_id", "hdf5_file"], "Scan table")
++    scans = add_subject_id_columns(scans, require_scan=True)
++    if scans["simulation_id"].isna().any() or scans["simulation_id"].duplicated().any():
++        raise ValueError("Scan simulation_id values must be present and unique")
++    required = ["subjid_base", "modeled_subjid", "simulation_id", "hdf5_fn", "treatment_course_id"]
++    _require_columns(course_hdf5_map, required, "Course HDF5 map")
++    mapping = course_hdf5_map.loc[course_hdf5_map["treatment_course_id"].notna()].copy()
++    if mapping[required].isna().any(axis=None) or mapping["treatment_course_id"].duplicated().any():
++        raise ValueError("Each mapped clinical course must identify exactly one complete simulation assignment")
++    checked = mapping.merge(scans[["simulation_id", "subjid", "subjid_base", "hdf5_file"]],
++                            on="simulation_id", how="left", validate="many_to_one", suffixes=("", "_scan"))
++    paths_match = [Path(str(a)).resolve() == Path(str(b)).resolve()
++                   for a, b in zip(checked["hdf5_fn"], checked["hdf5_file"], strict=True)]
++    if (checked["subjid"].isna().any() or checked["subjid"].ne(checked["modeled_subjid"]).any()
++            or checked["subjid_base"].ne(checked["subjid_base_scan"]).any() or not all(paths_match)):
++        raise ValueError("Course HDF5 map conflicts with selected scan/path identities")
++    cog = validate_treatment_courses(cognitive, outcome_col=outcome_col)
++    eligible = cog.loc[cog["subjid_base"].isin(scans["subjid_base"])]
++    if set(mapping["treatment_course_id"]) != set(eligible["treatment_course_id"]):
++        raise ValueError("Course HDF5 map does not cover exactly the eligible clinical courses for selected patients")
++    cog = cog.drop(columns=["scan_id"]).rename(columns={"subjid": "clinical_subjid"})
++    metadata = mapping.drop(columns=[c for c in ["date_start", "date_end (acute)"] if c in mapping])
++    result = metadata.merge(cog, on=["subjid_base", "treatment_course_id"], how="inner", validate="one_to_one",
++                            suffixes=("", "_clinical"))
++    if len(result) != len(mapping):
++        raise ValueError("Course mapping has inconsistent patient/course identities")
++    result = result.merge(scans, on=["simulation_id", "subjid_base"], validate="many_to_one", suffixes=("", "_scan"))
++    if result.empty:
++        raise ValueError("No selected simulations have an eligible treatment course")
++    unmatched = sorted(set(scans["simulation_id"]).difference(result["simulation_id"]))
++    if unmatched:
++        warnings.warn(f"Simulations retained in ROI/PCA without eligible outcomes: {unmatched}", UserWarning, stacklevel=2)
++    result["observation_id"] = result["simulation_id"] + "__" + result["treatment_course_id"]
++    return result.sort_values(["subjid", "date_start"]).reset_index(drop=True)
++
++
+ def collapse_person_rows(
+     df: pd.DataFrame,
+     *,
+@@ -440,8 +627,17 @@ def prepare_scan_course_outcomes(
+     cognitive_id_col: str = "subjid",
+     outcome_col: str = "cgi_change",
+     start_date_col: str = "date_start",
++    course_hdf5_map: pd.DataFrame | None = None,
+ ) -> pd.DataFrame:
+-    """Expand modeled scans to all treatment courses matched by ``subjid_base``."""
++    """Use explicit course assignments when supplied; otherwise retain legacy matching."""
++    if course_hdf5_map is not None:
++        if not isinstance(scan_ids, pd.DataFrame):
++            raise TypeError("Explicit course matching requires a scan DataFrame with simulation_id and hdf5_file")
++        if scan_id_col != "subjid" or cognitive_id_col != "subjid" or start_date_col != "date_start":
++            raise ValueError("Explicit course matching requires the standard subject and date column names")
++        return prepare_mapped_course_outcomes(scan_ids, cognitive, course_hdf5_map, outcome_col=outcome_col)
++    if isinstance(scan_ids, pd.DataFrame) and "simulation_id" in scan_ids:
++        raise ValueError("Simulations indexed by simulation_id require explicit course_hdf5_map")
+     if isinstance(scan_ids, pd.DataFrame):
+         _require_columns(scan_ids, [scan_id_col], "Scan table")
+         scans = scan_ids.rename(columns={scan_id_col: "subjid"}) if scan_id_col != "subjid" else scan_ids.copy()
+diff --git a/05_analysis/simnibs_parcel_analysis/mesh_io.py b/05_analysis/simnibs_parcel_analysis/mesh_io.py
+index 231ec7d..3fcc8ad 100644
+--- a/05_analysis/simnibs_parcel_analysis/mesh_io.py
++++ b/05_analysis/simnibs_parcel_analysis/mesh_io.py
+@@ -30,9 +30,10 @@ def build_hdf5_inventory(
+     hdf5_files: Sequence[str | Path],
+     *,
+     subject_ids: Sequence[str] | None = None,
++    simulation_ids: Sequence[str] | None = None,
+     require_files: bool = True,
+ ) -> pd.DataFrame:
+-    """Build a strict one-row-per-modeled-scan HDF5 inventory."""
++    """Build an HDF5 inventory; explicit simulation IDs allow multiple fields per scan."""
+     paths = [Path(path) for path in hdf5_files]
+     if not paths:
+         raise ValueError("hdf5_files is empty")
+@@ -51,13 +52,25 @@ def build_hdf5_inventory(
+     inventory = pd.DataFrame({"subjid": list(subject_ids), "hdf5_file": [str(path) for path in paths]})
+     inventory = add_subject_id_columns(inventory, require_scan=True)
+ 
+-    duplicate_ids = inventory.loc[inventory["subjid"].duplicated(keep=False), "subjid"].tolist()
++    key = "subjid"
++    if simulation_ids is not None:
++        if len(simulation_ids) != len(paths):
++            raise ValueError("simulation_ids and hdf5_files must have equal lengths")
++        if any(not isinstance(value, str) for value in simulation_ids):
++            raise TypeError("simulation_ids must contain strings")
++        values = pd.Series(list(simulation_ids), dtype="string").str.strip()
++        if values.isna().any() or values.eq("").any():
++            raise ValueError("simulation_ids must be nonempty strings")
++        inventory["simulation_id"] = values
++        key = "simulation_id"
++    duplicate_ids = inventory.loc[inventory[key].duplicated(keep=False), key].tolist()
+     if duplicate_ids:
+-        raise ValueError(f"Duplicate modeled-scan IDs: {duplicate_ids}")
++        raise ValueError(f"Duplicate {key} values: {duplicate_ids}")
+     duplicate_paths = inventory.loc[inventory["hdf5_file"].duplicated(keep=False), "hdf5_file"].tolist()
+     if duplicate_paths:
+         raise ValueError(f"Duplicate HDF5 paths: {duplicate_paths}")
+-    return inventory[["subjid", "subjid_base", "scan_id", "hdf5_file"]]
++    columns = ["subjid", "subjid_base", "scan_id", "hdf5_file"]
++    return inventory[columns + (["simulation_id"] if simulation_ids is not None else [])]
+ 
+ 
+ def load_hdf5_mesh(
+diff --git a/05_analysis/simnibs_parcel_analysis/pca.py b/05_analysis/simnibs_parcel_analysis/pca.py
+index 1b6d8d9..8de06ed 100644
+--- a/05_analysis/simnibs_parcel_analysis/pca.py
++++ b/05_analysis/simnibs_parcel_analysis/pca.py
+@@ -500,6 +500,7 @@ def correlate_predictors(
+                 "predictor": predictor_name,
+                 "n_observations": len(x),
+                 "n_scans": aligned[subject_col].nunique(),
++                **({"n_simulations": aligned["simulation_id"].nunique()} if predictors.index.name == "simulation_id" else {}),
+                 "n_treatment_courses": n_courses,
+                 "n_people": n_people,
+                 "r": float(result.statistic),
+@@ -523,7 +524,8 @@ def expand_predictors_to_courses(
+     outcome_col: str = "cgi_change",
+     observation_col: str = "observation_id",
+ ) -> pd.DataFrame:
+-    """Attach one scan-level predictor row to every matched treatment course."""
++    """Attach predictors by simulation_id when present, retaining canonical scan IDs."""
++    subject_col = "simulation_id" if predictors.index.name == "simulation_id" else subject_col
+     if predictors.index.has_duplicates:
+         duplicates = predictors.index[
+             predictors.index.duplicated()
+diff --git a/05_analysis/simnibs_parcel_analysis/pipeline.py b/05_analysis/simnibs_parcel_analysis/pipeline.py
+index e460502..6463c0a 100644
+--- a/05_analysis/simnibs_parcel_analysis/pipeline.py
++++ b/05_analysis/simnibs_parcel_analysis/pipeline.py
+@@ -57,12 +57,14 @@ def run_pca_outcome_analysis(
+     global_mean_brain_e: pd.Series | None = None,
+     brain_tags: Sequence[int] = (1, 2),
+     field_name: str = "magnE_mean",
++    course_hdf5_map: pd.DataFrame | None = None,
+ ) -> AnalysisResult:
+     """Fit the requested PCA, correlate global/PC predictors, and save outputs."""
+     output_dir = Path(output_dir)
+     output_dir.mkdir(parents=True, exist_ok=True)
+     parcel_values = summary.p95(p95_method)
+-    outcomes = prepare_scan_course_outcomes(summary.scans, cognitive, outcome_col=outcome_col)
++    outcomes = prepare_scan_course_outcomes(summary.scans, cognitive, outcome_col=outcome_col,
++                                           course_hdf5_map=course_hdf5_map)
+     if demean_by is None:
+         pca_result = fit_parcel_pca(parcel_values)
+     else:
+@@ -125,7 +127,9 @@ def run_pca_outcome_analysis(
+         "brain_mean_domain": "volume brain tetrahedra, including for surface PCA" if demean_by == "brain_mean" else None,
+         "multiple_testing_family": "global predictors and selected PCs within this atlas/P95/preprocessing run",
+         "clinical_observation": "one treatment course per unique (subjid_base, date_start)",
+-        "predictor_matching": "each modeled scan is matched to every treatment course sharing subjid_base",
++        "predictor_matching": ("explicit per-course modal-placement HDF5 assignment" if course_hdf5_map is not None
++                               else "each modeled scan is matched to every treatment course sharing subjid_base"),
++        "pca_row_identity": "simulation_id" if course_hdf5_map is not None else "subjid",
+         "unmatched_scans": "retained in ROI/PCA outputs and excluded from outcome correlations",
+         "correlation": "scan-course Pearson; repeated scans and repeated courses within people are not independent",
+     }
+diff --git a/05_analysis/simnibs_parcel_analysis/summary.py b/05_analysis/simnibs_parcel_analysis/summary.py
+index 387276a..b96a007 100644
+--- a/05_analysis/simnibs_parcel_analysis/summary.py
++++ b/05_analysis/simnibs_parcel_analysis/summary.py
+@@ -124,7 +124,10 @@ def build_parcel_summary(
+     """Assemble per-scan rows after enforcing identical parcel columns."""
+     if not (len(scans) == len(ordinary_rows) == len(weighted_rows) == len(size_rows) == len(count_rows) == len(qc_rows)):
+         raise ValueError("Summary row counts do not match scan count")
+-    index = pd.Index(scans["subjid"].astype(str), name="subjid")
++    key = "simulation_id" if "simulation_id" in scans else "subjid"
++    index = pd.Index(scans[key].astype(str), name=key)
++    if index.has_duplicates:
++        raise ValueError(f"Parcel summary requires unique {key} values")
+     frames = [pd.DataFrame(rows, index=index) for rows in (ordinary_rows, weighted_rows, size_rows, count_rows)]
+     expected = frames[0].columns
+     for name, frame in zip(("weighted P95", "parcel size", "parcel count"), frames[1:], strict=True):
+diff --git a/05_analysis/tests/test_course_modal_selection.py b/05_analysis/tests/test_course_modal_selection.py
+new file mode 100644
+index 0000000..0b96426
+--- /dev/null
++++ b/05_analysis/tests/test_course_modal_selection.py
+@@ -0,0 +1,274 @@
++"""Course-specific placement selection and full weighted/demeaned pipeline regression."""
++
++from __future__ import annotations
++
++import contextlib
++import io
++import json
++from pathlib import Path
++import tempfile
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++import warnings
++
++import numpy as np
++import pandas as pd
++
++import example_usage_global_E_weighted as pipeline
++import run_pca_weighted_global_E_job_synthsr as runner
++from simnibs_parcel_analysis.atlas_surface import build_surface_roi_summary
++from simnibs_parcel_analysis.atlas_volume import build_volume_roi_summary
++from simnibs_parcel_analysis.clinical import (
++    load_ect_sessions, modal_placements_by_course, prepare_scan_course_outcomes, select_modal_course_hdf5,
++)
++from simnibs_parcel_analysis.mesh_io import build_hdf5_inventory
++from simnibs_parcel_analysis.pca import DEMEAN_REFERENCES, expand_predictors_to_courses
++
++
++def fixture(root: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
++    rows, courses, inventory = [], [], []
++    configurations = {901: [(1, ["rul", "rul", "bt"]), (2, ["bt", "bt", "rul"]), (3, ["rul"])],
++                      902: [(1, ["bl"])], 903: [(1, ["bf"])], 904: [(1, ["rul"])]}
++    for patient, series_list in configurations.items():
++        base = f"subj-cat-{patient:03d}"
++        for series, placements in series_list:
++            start = pd.Timestamp(2022, series, 1)
++            for session, placement in enumerate(placements, start=1):
++                rows.append({"subjid": base, "series_num": series, "session_num": session,
++                             "date": start + pd.Timedelta(days=session - 1), "electrode_placement": placement,
++                             "frequency_hz": "age", "percent_charge": 50})
++            if patient != 904:
++                courses.append({"subjid": base, "series_num": series, "date_start": start,
++                                "date_end (acute)": start + pd.Timedelta(days=10),
++                                "cgi_start": 7, "cgi_end": 7 - (patient - 900) - series, "mrn": "synthetic"})
++        dataset = "org" if patient < 903 else "synth"
++        scan = base + "-001"
++        for placement in sorted({p.upper() for _, values in series_list for p in values} | {"BF"}):
++            path = root / dataset / "skin_double" / scan / placement / "95" / "run1" / "step_2" / "tdcs_uq_gpc.hdf5"
++            inventory.append({"dataset_root": dataset, "model_type_dir": "skin_double", "subject_dir": scan,
++                              "electrode_configuration": placement, "step": "step_2", "full_file_path": str(path)})
++    return pd.DataFrame(rows), pd.DataFrame(inventory), pd.DataFrame(courses)
++
++
++def select(sessions: pd.DataFrame, inventory: pd.DataFrame, cognitive: pd.DataFrame, **kwargs):
++    return select_modal_course_hdf5(sessions, inventory, cognitive, model_type="skin_double",
++                                    simulation_type="adaptive", **kwargs)
++
++
++class TestCourseSelection(unittest.TestCase):
++    def setUp(self) -> None:
++        self.sessions, self.inventory, self.cognitive = fixture(Path("/synthetic"))
++
++    def test_modes_are_per_patient_and_series_and_ignore_missing_with_counts(self) -> None:
++        df = self.sessions.iloc[:3].copy()
++        for number, value in enumerate([None, "nan", " "], start=4):
++            df = pd.concat([df, df.iloc[[0]].assign(session_num=number, electrode_placement=value)], ignore_index=True)
++        with self.assertWarnsRegex(UserWarning, "Ignoring 3"):
++            result = modal_placements_by_course(df).iloc[0]
++        self.assertEqual(result.electrode_placement, "RUL")
++        self.assertEqual((result.n_sessions, result.n_known_placements, result.n_modal_sessions), (6, 3, 2))
++        self.assertAlmostEqual(result.modal_fraction, 2 / 3)
++        self.assertEqual(json.loads(result.placement_counts), {"BT": 1, "RUL": 2})
++
++    def test_ties_empty_modes_invalid_labels_and_duplicate_sessions_are_errors(self) -> None:
++        for placements, message in [(["BT", "RUL"], "Tied modal"), ([None, "nan"], "No known"),
++                                     (["RUL", "unknown"], "invalid electrode")]:
++            with self.subTest(placements=placements), self.assertRaisesRegex(ValueError, message):
++                modal_placements_by_course(self.sessions.iloc[:2].assign(electrode_placement=placements))
++        with self.assertRaisesRegex(ValueError, "Duplicate patient/series/session"):
++            modal_placements_by_course(pd.concat([self.sessions, self.sessions.iloc[[0]]]))
++
++    def test_different_course_modes_and_reused_fields_select_unique_hdf5s(self) -> None:
++        selected, mapping = select(self.sessions, self.inventory, self.cognitive)
++        patient = mapping.loc[mapping.subjid_base.eq("subj-cat-901")]
++        self.assertEqual(patient.electrode_placement.tolist(), ["RUL", "BT", "RUL"])
++        self.assertEqual(patient.iloc[0].hdf5_fn, patient.iloc[2].hdf5_fn)
++        self.assertNotEqual(patient.iloc[0].simulation_id, patient.iloc[1].simulation_id)
++        self.assertEqual(len(selected), 5)
++        self.assertEqual(len(mapping), 6)
++        self.assertTrue(mapping.loc[mapping.subjid_base.eq("subj-cat-904"), "treatment_course_id"].isna().all())
++
++    def test_acute_window_excludes_maintenance_and_dates_can_identify_series(self) -> None:
++        maintenance = pd.concat([self.sessions.iloc[[0]].assign(session_num=n, date="2022-01-25", electrode_placement="BT")
++                                 for n in range(4, 8)], ignore_index=True)
++        sessions = pd.concat([self.sessions, maintenance], ignore_index=True)
++        _, mapping = select(sessions, self.inventory, self.cognitive.drop(columns="series_num"))
++        first = mapping.iloc[0]
++        self.assertEqual(first.electrode_placement, "RUL")
++        self.assertEqual(first.n_sessions, 3)
++        self.assertEqual(first.mode_scope, "acute_date_window")
++
++    def test_missing_or_ambiguous_series_and_reused_series_are_errors(self) -> None:
++        bad = self.cognitive.drop(columns="series_num").copy()
++        bad.loc[0, "date_end (acute)"] = pd.Timestamp("2022-02-15")
++        with self.assertRaisesRegex(ValueError, "exactly one stimulus series"):
++            select(self.sessions, self.inventory, bad)
++        bad = self.cognitive.copy()
++        bad.loc[0, "series_num"] = 99
++        with self.assertRaisesRegex(ValueError, "conflicts with stimulus dates"):
++            select(self.sessions, self.inventory, bad)
++        extra = self.cognitive.iloc[[0]].assign(date_start=pd.Timestamp("2022-01-02"))
++        with self.assertRaisesRegex(ValueError, "same stimulus patient/series"):
++            select(self.sessions, self.inventory, pd.concat([self.cognitive, extra]))
++
++    def test_missing_modal_simulation_never_uses_nonmodal_field(self) -> None:
++        query = self.inventory.loc[~(self.inventory.subject_dir.eq("subj-cat-901-001")
++                                    & self.inventory.electrode_configuration.eq("RUL"))]
++        with self.assertRaisesRegex(ValueError, "No matching HDF5"):
++            select(self.sessions, query, self.cognitive)
++
++    def test_duplicate_runs_checked_after_nonmodal_selection(self) -> None:
++        unused = self.inventory.loc[self.inventory.subject_dir.eq("subj-cat-902-001")
++                                     & self.inventory.electrode_configuration.eq("BF")].copy()
++        unused["full_file_path"] = unused.full_file_path.str.replace("/run1/", "/run2/")
++        self.assertEqual(len(select(self.sessions, pd.concat([self.inventory, unused]), self.cognitive)[0]), 5)
++        modal = self.inventory.loc[self.inventory.electrode_configuration.eq("RUL")].copy()
++        modal["full_file_path"] = modal.full_file_path.str.replace("/run1/", "/run2/")
++        with self.assertRaisesRegex(ValueError, "Multiple HDF5 files"):
++            select(self.sessions, pd.concat([self.inventory, modal]), self.cognitive)
++
++    def test_multiple_scans_require_map_and_alias_is_explicit(self) -> None:
++        second = self.inventory.loc[self.inventory.subject_dir.eq("subj-cat-901-001")].copy()
++        second["subject_dir"] = "subj-cat-901-002"
++        second["full_file_path"] = second.full_file_path.str.replace("901-001", "901-002")
++        query = pd.concat([self.inventory, second])
++        with self.assertRaisesRegex(ValueError, "require subject_scan_map"):
++            select(self.sessions, query, self.cognitive)
++        selected, mapping = select(self.sessions, query, self.cognitive, subject_scan_map={"subj-cat-901": "subj-cat-901-002"})
++        self.assertEqual(set(mapping.loc[mapping.subjid_base.eq("subj-cat-901"), "modeled_subjid"]), {"subj-cat-901-002"})
++        query = self.inventory.copy()
++        query["electrode_configuration"] = query.electrode_configuration.replace({"BT": "BL"})
++        query["full_file_path"] = query.full_file_path.str.replace("/BT/", "/BL/")
++        with self.assertRaisesRegex(ValueError, "No matching HDF5"):
++            select(self.sessions, query, self.cognitive)
++        _, mapping = select(self.sessions, query, self.cognitive, electrode_placement_map={"BT": "BL"})
++        bt = mapping.loc[mapping.electrode_placement.eq("BT")].iloc[0]
++        self.assertEqual(bt.simulated_placement, "BL")
++
++    def test_explicit_outcome_join_keeps_course_specific_fields_and_actual_scan_counts(self) -> None:
++        selected, mapping = select(self.sessions, self.inventory, self.cognitive)
++        scans = build_hdf5_inventory(selected.full_file_path, simulation_ids=selected.simulation_id, require_files=False)
++        cognitive = self.cognitive.assign(cgi_change=self.cognitive.cgi_end - self.cognitive.cgi_start)
++        with self.assertWarnsRegex(UserWarning, "retained in ROI/PCA"):
++            outcomes = prepare_scan_course_outcomes(scans, cognitive, course_hdf5_map=mapping)
++        predictors = pd.DataFrame({"field": [100, 200, 300, 400, 500]},
++                                  index=pd.Index(selected.simulation_id, name="simulation_id"))
++        aligned = expand_predictors_to_courses(predictors, outcomes)
++        patient = aligned.loc[aligned.subjid_base.eq("subj-cat-901")].sort_values("date_start")
++        self.assertEqual(patient.field.iloc[0], patient.field.iloc[2])
++        self.assertNotEqual(patient.field.iloc[0], patient.field.iloc[1])
++        self.assertEqual(len(aligned), 5)
++        self.assertEqual(aligned.subjid.nunique(), 3)
++        with self.assertRaisesRegex(ValueError, "require explicit course_hdf5_map"):
++            prepare_scan_course_outcomes(scans, cognitive)
++        invalid = mapping.copy()
++        invalid.loc[0, "hdf5_fn"] = "/wrong/file.hdf5"
++        with self.assertRaisesRegex(ValueError, "conflicts with selected"):
++            prepare_scan_course_outcomes(scans, cognitive, course_hdf5_map=invalid)
++
++    def test_workbook_selection_only_runner_uses_stimulus_and_exports_mapping(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            sessions, query, cognitive = fixture(root)
++            for path in query.full_file_path.map(Path):
++                path.parent.mkdir(parents=True, exist_ok=True)
++                path.touch()
++            workbook, csv = root / "cog.xlsx", root / "query.csv"
++            with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
++                cognitive.to_excel(writer, sheet_name="scores", index=False)
++                sessions.to_excel(writer, sheet_name="stimulus", index=False)
++            query.to_csv(csv, index=False)
++            loaded = load_ect_sessions(workbook)
++            self.assertEqual(loaded.frequency_hz.unique().tolist(), ["age"])
++            args = ["runner", "--model-type", "skin_double", "--analysis-mode", "adaptive",
++                    "--cognitive-scores", str(workbook), "--query-path", str(csv), "--selection-only"]
++            with patch("sys.argv", args), patch.object(runner, "OUTPUT_ROOT", root / "output"), \
++                    patch.object(runner, "SUBJECTS_DIR_BY_DATASET", {"org": root, "synth": root}), \
++                    patch.object(runner, "run_all_atlases_global_p95_weighted") as analyze, \
++                    contextlib.redirect_stdout(io.StringIO()):
++                runner.main()
++            analyze.assert_not_called()
++            destination = root / "output" / "skin_double" / "adaptive" / "selection_preview"
++            self.assertEqual(len(pd.read_csv(destination / "selected_hdf5_inventory.csv")), 5)
++            self.assertEqual(len(pd.read_csv(destination / "course_hdf5_mapping.csv")), 6)
++
++
++class TestModalPipelineIntegration(unittest.TestCase):
++    def test_all_atlases_and_preprocessing_modes_with_two_placements_for_one_scan(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            sessions, query, cognitive = fixture(root)
++            selected, mapping = select(sessions, query, cognitive)
++            paths = [Path(value) for value in selected.full_file_path]
++            values = [[1, 2, 3, 5, 6, 8, 9, 10], [6, 9, 3, 4, 4, 10, 2, 3], [2, 5, 7, 8, 4, 6, 9, 15],
++                      [10, 14, 6, 7, 3, 9, 8, 10], [5, 8, 6, 12, 15, 20, 4, 9]]
++            by_path = dict(zip(map(str, paths), values, strict=True))
++            sources = {path: root / ("fs_org" if "/org/" in str(path) else "fs_synth") for path in paths}
++            for path, fs in sources.items():
++                path.parent.mkdir(parents=True, exist_ok=True)
++                path.touch()
++                overlay = path.parent / "fsavg_overlays" / "tdcs_uq_gpc_fsavg.msh"
++                overlay.parent.mkdir()
++                overlay.touch()
++                scan = pipeline.infer_subject_id(path)
++                (fs / scan / "mri").mkdir(parents=True, exist_ok=True)
++                for name in ["aparc+aseg.mgz", "aparc.a2009s+aseg.mgz"]:
++                    (fs / scan / "mri" / name).touch()
++
++            def mesh(path: str, *args, surface: bool = False):
++                if surface:
++                    path = str(Path(path).parent.parent / "tdcs_uq_gpc.hdf5")
++                field = SimpleNamespace(value=np.array(by_path[str(path)], dtype=float), field_name="magnE_mean")
++                return SimpleNamespace(field={"magnE_mean": field}, elmdata=[] if surface else [field],
++                                       nodedata=[field] if surface else [], nodes=SimpleNamespace(nr=8),
++                                       elm=SimpleNamespace(nr=8, elm_type=np.full(8, 4), tag1=np.full(8, 2)),
++                                       elements_baricenters=lambda: np.column_stack([np.arange(8), np.zeros((8, 2))]),
++                                       elements_volumes_and_areas=lambda: np.arange(1, 9), nodes_areas=lambda: np.arange(1, 9))
++
++            lut = {10: "Left-Thalamus", 11: "Left-Caudate", 12: "Left-Putamen", 13: "Left-Pallidum"}
++            def volume(files, fs, **kw):
++                kw.update(mesh_loader=mesh, atlas_loader=lambda path: (np.repeat(list(lut), 2).reshape(8, 1, 1), np.eye(4)),
++                          lut=lut, min_elements_per_roi=1)
++                return build_volume_roi_summary(files, fs, **kw)
++
++            def surface(files, **kw):
++                kw.update(mesh_loader=lambda path: mesh(path, surface=True), min_nodes_per_roi=1,
++                          atlas_loader=lambda name: {f"ROI{i}": np.repeat(np.arange(4) == i, 2) for i in range(4)})
++                return build_surface_roi_summary(files, **kw)
++
++            fake_simnibs = SimpleNamespace(Msh=SimpleNamespace(read_hdf5=mesh))
++            with patch.dict("sys.modules", {"simnibs": fake_simnibs}), \
++                    patch.object(pipeline, "inspect_hdf5_mesh", return_value={}), \
++                    patch.object(pipeline, "build_volume_roi_summary", side_effect=volume), \
++                    patch.object(pipeline, "build_surface_roi_summary", side_effect=surface), \
++                    patch("matplotlib.figure.Figure.savefig"), contextlib.redirect_stdout(io.StringIO()), \
++                    warnings.catch_warnings():
++                warnings.simplefilter("ignore", UserWarning)
++                results = pipeline.run_all_atlases_global_p95_weighted(
++                    paths, cognitive, root / "output", subjects_dir_by_hdf5=sources,
++                    simulation_ids=selected.simulation_id.tolist(), course_hdf5_map=mapping,
++                    demean_references=DEMEAN_REFERENCES)
++            self.assertEqual(len(results), 24)
++            for key, result in results.items():
++                with self.subTest(branch=key):
++                    self.assertEqual(len(result.summary.scans), 5)
++                    self.assertEqual(result.pca.scores.index.name, "simulation_id")
++                    self.assertEqual(len(result.outcomes), 5)
++                    self.assertEqual(result.outcomes.subjid.nunique(), 3)
++                    self.assertEqual(result.outcomes.simulation_id.nunique(), 4)
++                    self.assertEqual(result.correlations.n_scans.unique().tolist(), [3])
++                    self.assertEqual(result.correlations.n_simulations.unique().tolist(), [4])
++                    self.assertEqual(result.correlations.n_people.unique().tolist(), [3])
++                    self.assertEqual(result.correlations.n_observations.unique().tolist(), [5])
++                    aligned = expand_predictors_to_courses(result.predictors, result.outcomes)
++                    patient = aligned.loc[aligned.subjid_base.eq("subj-cat-901")].sort_values("date_start")
++                    np.testing.assert_allclose(patient.iloc[0][result.predictors.columns].astype(float),
++                                               patient.iloc[2][result.predictors.columns].astype(float))
++            settings = json.loads((root / "output/volume_aparc/weighted_p95/analysis_settings.json").read_text())
++            self.assertEqual(settings["pca_row_identity"], "simulation_id")
++            self.assertIn("modal-placement", settings["predictor_matching"])
++
++
++if __name__ == "__main__":
++    unittest.main()

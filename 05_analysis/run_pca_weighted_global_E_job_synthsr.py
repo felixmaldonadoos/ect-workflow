@@ -8,7 +8,8 @@ from typing import Mapping
 import pandas as pd
 
 from example_usage_global_E_weighted import run_all_atlases_global_p95_weighted
-from simnibs_parcel_analysis.identifiers import infer_subject_id
+from simnibs_parcel_analysis.identifiers import add_subject_id_columns, infer_subject_id
+from simnibs_parcel_analysis.clinical import load_ect_sessions, load_hdf5_query, select_modal_course_hdf5
 from simnibs_parcel_analysis.pca import DEMEAN_REFERENCES
 import argparse
 
@@ -24,6 +25,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--analysis-mode", choices=tuple(ANALYSIS_STEP_BY_MODE), required=True)
     parser.add_argument("--demean-by", nargs="+", choices=DEMEAN_REFERENCES, default=(),
                         help="Add these demeaning analyses alongside the existing weighted/unweighted results.")
+    parser.add_argument("--query-path", type=Path, default=QUERY_PATH)
+    parser.add_argument("--cognitive-scores", type=Path, default=COGNITIVE_SCORES_PATH)
+    parser.add_argument("--stimulus-sheet", default="stimulus")
+    parser.add_argument("--subject-scan-map", type=Path, help="JSON mapping base patient IDs to preferred modeled scans.")
+    parser.add_argument("--placement-alias", action="append", default=[], metavar="CLINICAL=SIMULATED",
+                        help="Explicit HDF5 placement alias, e.g. BT=BL; BL and BT are distinct by default.")
+    parser.add_argument("--selection-only", action="store_true", help="Export course/HDF5 selections without loading meshes or fitting PCA.")
     return parser.parse_args()
 
 QUERY_PATH = Path(
@@ -103,13 +111,7 @@ def add_base_subjid(df: pd.DataFrame, source_col: str = "subjid") -> pd.DataFram
             f"Empty subject IDs in column {source_col!r} at rows: {bad_rows}"
         )
 
-    df["subjid_base"] = df[source_col].str.replace(
-        r"-\d{3}$",
-        "",
-        regex=True,
-    )
-
-    return df
+    return add_subject_id_columns(df, source_col=source_col)
 
 def load_cogscores_batch(filename: str | Path) -> pd.DataFrame:
     """Load clinical treatment courses with complete CGI values."""
@@ -177,13 +179,13 @@ def load_hdf5_inventory(
     subjects_dirs: Mapping[str, Path],
     model_type_dir: str,
     step: str,) -> pd.DataFrame:
-    """Select and validate one HDF5 file per modeled scan."""
+    """Load candidate HDF5s; course-mode selection resolves placements afterward."""
     path = Path(filename)
 
     if not path.is_file():
         raise FileNotFoundError(f"Query-result file does not exist: {path}")
 
-    query = pd.read_csv(path)
+    query = load_hdf5_query(path, model_type=model_type_dir, simulation_type=step)
     required_columns = {
         "dataset_root",
         "model_type_dir",
@@ -257,31 +259,6 @@ def load_hdf5_inventory(
             f"from full_file_path:\n{mismatches.to_string(index=False)}"
         )
 
-    duplicate_subject_mask = selected["inferred_subjid"].duplicated(
-        keep=False
-    )
-
-    if duplicate_subject_mask.any():
-        duplicates = selected.loc[
-            duplicate_subject_mask,
-            ["dataset_root", "inferred_subjid", "full_file_path"],
-        ]
-        raise ValueError(
-            "Each modeled-scan ID must identify exactly one HDF5 file:\n"
-            f"{duplicates.to_string(index=False)}"
-        )
-
-    missing_files = sorted(
-        full_file_path
-        for full_file_path in selected["full_file_path"]
-        if not Path(full_file_path).is_file()
-    )
-
-    if missing_files:
-        raise FileNotFoundError(
-            f"Selected HDF5 files do not exist: {missing_files}"
-        )
-
     return selected.sort_values(
         ["dataset_root", "subject_dir", "full_file_path"]
     ).reset_index(drop=True)
@@ -309,7 +286,7 @@ def exclude_subject_results(
     missing_subjids = sorted(set(subjids).difference(inventory[subject_col]))
 
     if missing_subjids:
-        raise ValueError(f"Subjects were not found in the inventory: {missing_subjids}")
+        print(f"Configured exclusions already absent from this inventory: {missing_subjids}")
 
     excluded_mask = inventory[subject_col].isin(subjids)
     filtered = inventory.loc[~excluded_mask].copy()
@@ -325,6 +302,7 @@ def main() -> None:
     """Load both sources and run one pooled analysis."""
     args = parse_args()
     analysis_step, query_path, output_dir = resolve_analysis_config(args.model_type, args.analysis_mode)
+    query_path = args.query_path
 
     print(f"Model type: {args.model_type}")
     print(f"Analysis mode: {args.analysis_mode}")
@@ -332,7 +310,7 @@ def main() -> None:
     print(f"Query table: {query_path}")
     print(f"Output directory: {output_dir}")
 
-    df_cog = load_cogscores_batch(COGNITIVE_SCORES_PATH)
+    df_cog = load_cogscores_batch(args.cognitive_scores)
     inventory = load_hdf5_inventory(
         query_path,
         SUBJECTS_DIR_BY_DATASET,
@@ -340,10 +318,31 @@ def main() -> None:
         analysis_step,
     )
     inventory = exclude_subject_results(inventory, list(EXCLUDED_SUBJIDS))
-
+    aliases = {}
+    for value in args.placement_alias:
+        parts = value.split("=")
+        if len(parts) != 2 or parts[0].strip().upper() in aliases:
+            raise ValueError(f"Invalid or duplicate --placement-alias: {value!r}; use CLINICAL=SIMULATED")
+        aliases[parts[0].strip().upper()] = parts[1].strip().upper()
+    sessions = load_ect_sessions(args.cognitive_scores, args.stimulus_sheet, allow_missing_placement=True, acute_only=True)
+    candidate_count = len(inventory)
+    inventory, course_mapping = select_modal_course_hdf5(
+        sessions, inventory, df_cog, model_type=args.model_type, simulation_type=args.analysis_mode,
+        subject_scan_map=args.subject_scan_map, electrode_placement_map=aliases)
+    missing_files = [path for path in inventory["full_file_path"] if not Path(path).is_file()]
+    if missing_files:
+        raise FileNotFoundError(f"Selected HDF5 files do not exist: {missing_files}")
+    selection_dir = output_dir / "selection_preview" if args.selection_only else output_dir
+    selection_dir.mkdir(parents=True, exist_ok=True)
+    inventory.to_csv(selection_dir / "selected_hdf5_inventory.csv", index=False)
+    course_mapping.to_csv(selection_dir / "course_hdf5_mapping.csv", index=False)
+    print(f"Selected {len(inventory)} unique HDF5s from {candidate_count} candidates for {len(course_mapping)} stimulus courses")
+    print(course_mapping[["subjid_base", "series_num", "electrode_placement", "simulated_placement",
+                          "n_modal_sessions", "n_known_placements", "modeled_subjid"]].to_string(index=False))
+    if args.selection_only:
+        print(f"Selection tables saved in {selection_dir}")
+        return
     validate_analysis_paths(output_dir)
-
-    inventory.to_csv(output_dir / "selected_hdf5_inventory.csv", index=False)
 
     for dataset_root in SUBJECTS_DIR_BY_DATASET:
         count = inventory["dataset_root"].eq(dataset_root).sum()
@@ -373,6 +372,8 @@ def main() -> None:
         freesurfer_lut=FREESURFER_LUT,
         exclude_volume_rois_by_atlas=EXCLUDE_VOLUME_ROIS_BY_ATLAS,
         demean_references=args.demean_by,
+        simulation_ids=inventory["simulation_id"].tolist(),
+        course_hdf5_map=course_mapping,
     )
 
     dk = results["volume_aparc_weighted"]

@@ -30,9 +30,10 @@ def build_hdf5_inventory(
     hdf5_files: Sequence[str | Path],
     *,
     subject_ids: Sequence[str] | None = None,
+    simulation_ids: Sequence[str] | None = None,
     require_files: bool = True,
 ) -> pd.DataFrame:
-    """Build a strict one-row-per-modeled-scan HDF5 inventory."""
+    """Build an HDF5 inventory; explicit simulation IDs allow multiple fields per scan."""
     paths = [Path(path) for path in hdf5_files]
     if not paths:
         raise ValueError("hdf5_files is empty")
@@ -51,13 +52,25 @@ def build_hdf5_inventory(
     inventory = pd.DataFrame({"subjid": list(subject_ids), "hdf5_file": [str(path) for path in paths]})
     inventory = add_subject_id_columns(inventory, require_scan=True)
 
-    duplicate_ids = inventory.loc[inventory["subjid"].duplicated(keep=False), "subjid"].tolist()
+    key = "subjid"
+    if simulation_ids is not None:
+        if len(simulation_ids) != len(paths):
+            raise ValueError("simulation_ids and hdf5_files must have equal lengths")
+        if any(not isinstance(value, str) for value in simulation_ids):
+            raise TypeError("simulation_ids must contain strings")
+        values = pd.Series(list(simulation_ids), dtype="string").str.strip()
+        if values.isna().any() or values.eq("").any():
+            raise ValueError("simulation_ids must be nonempty strings")
+        inventory["simulation_id"] = values
+        key = "simulation_id"
+    duplicate_ids = inventory.loc[inventory[key].duplicated(keep=False), key].tolist()
     if duplicate_ids:
-        raise ValueError(f"Duplicate modeled-scan IDs: {duplicate_ids}")
+        raise ValueError(f"Duplicate {key} values: {duplicate_ids}")
     duplicate_paths = inventory.loc[inventory["hdf5_file"].duplicated(keep=False), "hdf5_file"].tolist()
     if duplicate_paths:
         raise ValueError(f"Duplicate HDF5 paths: {duplicate_paths}")
-    return inventory[["subjid", "subjid_base", "scan_id", "hdf5_file"]]
+    columns = ["subjid", "subjid_base", "scan_id", "hdf5_file"]
+    return inventory[columns + (["simulation_id"] if simulation_ids is not None else [])]
 
 
 def load_hdf5_mesh(

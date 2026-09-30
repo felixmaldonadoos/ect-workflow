@@ -14,13 +14,20 @@ import pandas as pd
 from .identifiers import add_subject_id_columns, base_subject_id, build_scan_table
 
 
-def load_ect_sessions(fn: str | Path, sheet_name: str | int = "stimulus") -> pd.DataFrame:
+def load_ect_sessions(
+    fn: str | Path, sheet_name: str | int = "stimulus", *,
+    allow_missing_placement: bool = False, acute_only: bool = False,
+) -> pd.DataFrame:
     """Load one row per ECT session, preserving all clinical columns.
 
     Validate only the session identity, date, and placement needed for matching.
     Other treatment variables remain untouched, including a temporary ``age``
     placeholder in frequency_hz. Session numbers need not restart at each series.
     No CGI eligibility filter or electric-field scaling is applied.
+    allow_missing_placement is for course-mode summaries only; it retains
+    missing/blank/literal 'nan' placements for explicit counting and warnings.
+    acute_only excludes rows without a finite positive integer series_num
+    before validating session IDs, dates, or placements. Series 0 is maintenance.
     """
     path = _require_file(fn, "ECT-session file")
     if path.suffix.lower() != ".xlsx":
@@ -28,7 +35,8 @@ def load_ect_sessions(fn: str | Path, sheet_name: str | int = "stimulus") -> pd.
     if isinstance(sheet_name, bool) or not isinstance(sheet_name, (str, int)):
         raise TypeError("sheet_name must identify one sheet by name or integer index")
     raw = pd.read_excel(path, sheet_name=sheet_name, header=None, keep_default_na=False, na_values=[""])
-    return _validate_ect_sessions(_ect_table_from_header(raw, "ECT-session sheet"))
+    return _validate_ect_sessions(_ect_table_from_header(raw, "ECT-session sheet"),
+                                  allow_missing_placement=allow_missing_placement, acute_only=acute_only)
 
 
 def load_hdf5_query(
@@ -251,8 +259,30 @@ def _ect_check_placements(placements: pd.Series, label: str) -> None:
         raise ValueError(f"{label} has invalid electrode placements: {placements.loc[invalid].to_dict()}")
 
 
-def _validate_ect_sessions(df: pd.DataFrame) -> pd.DataFrame:
+def _filter_acute_sessions(df: pd.DataFrame) -> pd.DataFrame:
+    """Explicitly exclude maintenance and invalid series labels before acute analysis."""
     result = _ect_clean_columns(df, "ECT-session table")
+    _require_columns(result, ["series_num"], "ECT-session table")
+    # Coercion is used only to identify the intentionally excluded rows. No
+    # missing course number is imputed, rounded, or carried forward.
+    values = pd.to_numeric(result["series_num"], errors="coerce")
+    boolean = result["series_num"].map(lambda value: isinstance(value, (bool, np.bool_)))
+    keep = (values.notna() & np.isfinite(values) & values.ge(1) & values.mod(1).eq(0) & ~boolean).fillna(False)
+    if (~keep).any():
+        columns = [name for name in ["subjid", "series_num", "session_num", "date", "electrode_placement"] if name in result]
+        excluded = result.loc[~keep, columns]
+        print(f"Excluding {len(excluded)} stimulus rows from acute analysis: series_num is below 1 or not a finite integer.")
+        print(excluded.to_string(index=True))
+    result = result.loc[keep].copy()
+    if result.empty:
+        raise ValueError("No acute ECT sessions remain after filtering series_num")
+    return result
+
+
+def _validate_ect_sessions(
+    df: pd.DataFrame, *, allow_missing_placement: bool = False, acute_only: bool = False,
+) -> pd.DataFrame:
+    result = _filter_acute_sessions(df) if acute_only else _ect_clean_columns(df, "ECT-session table")
     required = ["subjid", "series_num", "session_num", "date", "electrode_placement"]
     _require_columns(result, required, "ECT-session table")
     if result.empty:
@@ -272,8 +302,13 @@ def _validate_ect_sessions(df: pd.DataFrame) -> pd.DataFrame:
     result["date"] = pd.to_datetime(dates, format="mixed", errors="raise").dt.normalize()
     if result["date"].isna().any():
         raise ValueError(f"Invalid ECT-session dates at rows: {result.index[result['date'].isna()].tolist()}")
-    result["electrode_placement"] = _ect_required_text(result, "electrode_placement", "ECT-session table").str.upper()
-    _ect_check_placements(result["electrode_placement"], "ECT-session table")
+    placement = result["electrode_placement"].astype("string").str.strip().str.upper()
+    if allow_missing_placement:
+        placement = placement.mask(placement.isin(["", "NAN"]))
+        _ect_check_placements(placement.dropna(), "ECT-session table")
+    else:
+        _ect_check_placements(placement, "ECT-session table")
+    result["electrode_placement"] = placement
     duplicate = result.duplicated(["subjid_base", "series_num", "session_num"], keep=False)
     if duplicate.any():
         details = result.loc[duplicate, ["subjid", "series_num", "session_num", "date"]].to_string()
@@ -301,6 +336,186 @@ def _ect_placement_aliases(mapping: Mapping[str, str] | None) -> dict[str, str]:
             raise ValueError(f"Duplicate electrode_placement_map key after normalization: {source!r}")
         aliases[source] = target
     return aliases
+
+
+def modal_placements_by_course(sessions: pd.DataFrame) -> pd.DataFrame:
+    """Count acute sessions per patient/series; require a unique modal placement.
+
+    Exclude rows whose series_num is below 1 or not a finite integer.
+    Missing/blank/literal 'nan' placements are omitted from the count, with a
+    warning and exported counts. Invalid nonmissing placements, duplicate
+    sessions, ties, and series with no known placement are errors. BL and BT
+    remain distinct clinical labels. Other stimulus variables are not used.
+    """
+    sessions = _validate_ect_sessions(sessions, allow_missing_placement=True, acute_only=True)
+    rows = []
+    for (base, series), group in sessions.groupby(["subjid_base", "series_num"], sort=True):
+        counts = group["electrode_placement"].value_counts()
+        if counts.empty:
+            raise ValueError(f"No known electrode placement for {base}, series_num={series}")
+        modes = sorted(counts.index[counts.eq(counts.max())].tolist())
+        if len(modes) != 1:
+            raise ValueError(f"Tied modal electrode placements for {base}, series_num={series}: {counts.to_dict()}")
+        missing = int(group["electrode_placement"].isna().sum())
+        if missing:
+            warnings.warn(f"Ignoring {missing} missing placements for {base}, series_num={series}",
+                          UserWarning, stacklevel=2)
+        rows.append({"subjid_base": base, "series_num": int(series), "electrode_placement": modes[0],
+                     "n_sessions": len(group), "n_known_placements": int(counts.sum()),
+                     "n_missing_placements": missing, "n_modal_sessions": int(counts.max()),
+                     "modal_fraction": float(counts.max() / counts.sum()),
+                     "placement_counts": json.dumps({key: int(counts[key]) for key in sorted(counts.index)}),
+                     "first_session_date": group["date"].min(), "last_session_date": group["date"].max()})
+    return pd.DataFrame(rows)
+
+
+def select_modal_course_hdf5(
+    sessions: pd.DataFrame,
+    inventory: pd.DataFrame,
+    cognitive: pd.DataFrame,
+    *,
+    model_type: Literal["skin_single", "skin_double"],
+    simulation_type: Literal["static", "adaptive", "step_0", "step_2"],
+    subject_scan_map: Mapping[str, str] | str | Path | None = None,
+    electrode_placement_map: Mapping[str, str] | None = None,
+    outcome_col: str = "cgi_change",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Select one scan/placement per stimulus course, independent of CGI eligibility.
+
+    For complete clinical courses, match series_num explicitly when present;
+    otherwise require exactly one series with sessions in the inclusive acute
+    date interval. Count only sessions inside that interval. Other stimulus
+    series use all their sessions and remain eligible for ROI/PCA, without an
+    outcome. A series cannot silently represent two clinical courses.
+
+    The existing session mapper resolves scans (explicit map if ambiguous),
+    aliases, and HDF5 candidates. Nonmodal placements need no simulation.
+    Unique selected HDF5s enter PCA once even if reused by multiple courses.
+    """
+    query = load_hdf5_query(inventory, model_type=model_type, simulation_type=simulation_type)
+    bases = set(query["subjid_base"])
+    sessions = _validate_ect_sessions(sessions, allow_missing_placement=True, acute_only=True)
+    sessions = sessions.loc[sessions["subjid_base"].isin(bases)].copy()
+    missing = sorted(bases.difference(sessions["subjid_base"]))
+    if missing:
+        raise ValueError(f"No stimulus sessions for modeled patients; cannot select a course placement: {missing}")
+    if outcome_col not in cognitive:
+        cognitive = compute_cgi_change(cognitive, outcome_col=outcome_col)
+    cognitive = validate_treatment_courses(cognitive, outcome_col=outcome_col)
+    cognitive = cognitive.loc[cognitive["subjid_base"].isin(bases)].copy()
+    _require_columns(cognitive, ["date_end (acute)"], "Cognitive-score table")
+    if cognitive["date_end (acute)"].lt(cognitive["date_start"]).any():
+        raise ValueError("Clinical acute end date precedes course start date")
+
+    sessions_by_base = {base: group for base, group in sessions.groupby("subjid_base")}
+    windows = {}
+    for _, course in cognitive.iterrows():
+        available = sessions_by_base[course["subjid_base"]]
+        during = available.loc[available["date"].between(course["date_start"], course["date_end (acute)"])]
+        candidates = sorted(during["series_num"].unique().tolist())
+        supplied_series = course.get("series_num", pd.NA)
+        if pd.notna(supplied_series) and str(supplied_series).strip():
+            number = pd.to_numeric(supplied_series, errors="raise")
+            if isinstance(supplied_series, (bool, np.bool_)) or not np.isfinite(number) or number < 1 or number % 1:
+                raise ValueError(f"Invalid clinical series_num for {course['treatment_course_id']}: {supplied_series!r}")
+            # Other series inside the same acute window are a clinical ambiguity,
+            # even if a series number was supplied in the outcome sheet.
+            if candidates != [int(number)]:
+                raise ValueError(f"Clinical series_num conflicts with stimulus dates for {course['treatment_course_id']}; "
+                                 f"series in acute interval: {candidates}")
+            series = int(number)
+        elif len(candidates) == 1:
+            series = candidates[0]
+        else:
+            raise ValueError(f"Expected exactly one stimulus series in acute interval for {course['treatment_course_id']}; "
+                             f"found {candidates}")
+        key = (course["subjid_base"], series)
+        if key in windows:
+            raise ValueError(f"Multiple clinical courses map to the same stimulus patient/series: {key}")
+        windows[key] = course
+
+    pieces, links = [], []
+    for key, group in sessions.groupby(["subjid_base", "series_num"], sort=True):
+        course = windows.get(key)
+        if course is not None:
+            group = group.loc[group["date"].between(course["date_start"], course["date_end (acute)"])].copy()
+        pieces.append(group)
+        links.append({"subjid_base": key[0], "series_num": key[1],
+                      "treatment_course_id": course["treatment_course_id"] if course is not None else pd.NA,
+                      "mode_scope": "acute_date_window" if course is not None else "full_stimulus_series",
+                      "date_start": course["date_start"] if course is not None else pd.NaT,
+                      "date_end (acute)": course["date_end (acute)"] if course is not None else pd.NaT})
+    counted = pd.concat(pieces, ignore_index=True)
+    modes = modal_placements_by_course(counted)
+    modes = modes.merge(pd.DataFrame(links), on=["subjid_base", "series_num"], validate="one_to_one")
+    # Use an actual session having the modal placement to call the existing
+    # strict mapper. Its date/session_num are not used to choose an MRI scan.
+    representatives = counted.merge(modes[["subjid_base", "series_num", "electrode_placement"]],
+                                    on=["subjid_base", "series_num", "electrode_placement"], validate="many_to_one")
+    representatives = representatives.sort_values(["subjid_base", "series_num", "date", "session_num"])
+    representatives = representatives.drop_duplicates(["subjid_base", "series_num"])
+    mapped = map_sessions_to_hdf5(representatives, query, model_type=model_type, simulation_type=simulation_type,
+                                  subject_scan_map=subject_scan_map, electrode_placement_map=electrode_placement_map)
+    assignments = modes.merge(mapped[["subjid_base", "series_num", "modeled_subjid", "hdf5_fn"]],
+                              on=["subjid_base", "series_num"], validate="one_to_one")
+    selected = query.loc[query["hdf5_fn"].isin(assignments["hdf5_fn"])].copy()
+    if selected["hdf5_fn"].duplicated().any():
+        raise ValueError("Selected inventory contains repeated HDF5 paths")
+    # Model/step are fixed by this run; dataset + scan + placement distinguish
+    # alternative fields without changing canonical patient or scan IDs.
+    _require_columns(selected, ["dataset_root"], "HDF5 inventory")
+    selected["simulation_id"] = (selected["dataset_root"].astype(str) + "::" + selected["modeled_subjid"]
+                                  + "::" + selected["electrode_placement"])
+    if selected["simulation_id"].duplicated().any():
+        raise ValueError("Multiple selected HDF5s identify the same dataset/scan/placement")
+    assignments = assignments.merge(
+        selected[["hdf5_fn", "simulation_id", "dataset_root", "electrode_placement"]].rename(
+            columns={"electrode_placement": "simulated_placement"}), on="hdf5_fn", validate="many_to_one")
+    return selected.reset_index(drop=True), assignments.reset_index(drop=True)
+
+
+def prepare_mapped_course_outcomes(
+    scans: pd.DataFrame,
+    cognitive: pd.DataFrame,
+    course_hdf5_map: pd.DataFrame,
+    *,
+    outcome_col: str = "cgi_change",
+) -> pd.DataFrame:
+    """Join explicit simulation/course assignments without scan × course expansion."""
+    _require_columns(scans, ["subjid", "simulation_id", "hdf5_file"], "Scan table")
+    scans = add_subject_id_columns(scans, require_scan=True)
+    if scans["simulation_id"].isna().any() or scans["simulation_id"].duplicated().any():
+        raise ValueError("Scan simulation_id values must be present and unique")
+    required = ["subjid_base", "modeled_subjid", "simulation_id", "hdf5_fn", "treatment_course_id"]
+    _require_columns(course_hdf5_map, required, "Course HDF5 map")
+    mapping = course_hdf5_map.loc[course_hdf5_map["treatment_course_id"].notna()].copy()
+    if mapping[required].isna().any(axis=None) or mapping["treatment_course_id"].duplicated().any():
+        raise ValueError("Each mapped clinical course must identify exactly one complete simulation assignment")
+    checked = mapping.merge(scans[["simulation_id", "subjid", "subjid_base", "hdf5_file"]],
+                            on="simulation_id", how="left", validate="many_to_one", suffixes=("", "_scan"))
+    paths_match = [Path(str(a)).resolve() == Path(str(b)).resolve()
+                   for a, b in zip(checked["hdf5_fn"], checked["hdf5_file"], strict=True)]
+    if (checked["subjid"].isna().any() or checked["subjid"].ne(checked["modeled_subjid"]).any()
+            or checked["subjid_base"].ne(checked["subjid_base_scan"]).any() or not all(paths_match)):
+        raise ValueError("Course HDF5 map conflicts with selected scan/path identities")
+    cog = validate_treatment_courses(cognitive, outcome_col=outcome_col)
+    eligible = cog.loc[cog["subjid_base"].isin(scans["subjid_base"])]
+    if set(mapping["treatment_course_id"]) != set(eligible["treatment_course_id"]):
+        raise ValueError("Course HDF5 map does not cover exactly the eligible clinical courses for selected patients")
+    cog = cog.drop(columns=["scan_id"]).rename(columns={"subjid": "clinical_subjid"})
+    metadata = mapping.drop(columns=[c for c in ["date_start", "date_end (acute)"] if c in mapping])
+    result = metadata.merge(cog, on=["subjid_base", "treatment_course_id"], how="inner", validate="one_to_one",
+                            suffixes=("", "_clinical"))
+    if len(result) != len(mapping):
+        raise ValueError("Course mapping has inconsistent patient/course identities")
+    result = result.merge(scans, on=["simulation_id", "subjid_base"], validate="many_to_one", suffixes=("", "_scan"))
+    if result.empty:
+        raise ValueError("No selected simulations have an eligible treatment course")
+    unmatched = sorted(set(scans["simulation_id"]).difference(result["simulation_id"]))
+    if unmatched:
+        warnings.warn(f"Simulations retained in ROI/PCA without eligible outcomes: {unmatched}", UserWarning, stacklevel=2)
+    result["observation_id"] = result["simulation_id"] + "__" + result["treatment_course_id"]
+    return result.sort_values(["subjid", "date_start"]).reset_index(drop=True)
 
 
 def collapse_person_rows(
@@ -440,8 +655,17 @@ def prepare_scan_course_outcomes(
     cognitive_id_col: str = "subjid",
     outcome_col: str = "cgi_change",
     start_date_col: str = "date_start",
+    course_hdf5_map: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Expand modeled scans to all treatment courses matched by ``subjid_base``."""
+    """Use explicit course assignments when supplied; otherwise retain legacy matching."""
+    if course_hdf5_map is not None:
+        if not isinstance(scan_ids, pd.DataFrame):
+            raise TypeError("Explicit course matching requires a scan DataFrame with simulation_id and hdf5_file")
+        if scan_id_col != "subjid" or cognitive_id_col != "subjid" or start_date_col != "date_start":
+            raise ValueError("Explicit course matching requires the standard subject and date column names")
+        return prepare_mapped_course_outcomes(scan_ids, cognitive, course_hdf5_map, outcome_col=outcome_col)
+    if isinstance(scan_ids, pd.DataFrame) and "simulation_id" in scan_ids:
+        raise ValueError("Simulations indexed by simulation_id require explicit course_hdf5_map")
     if isinstance(scan_ids, pd.DataFrame):
         _require_columns(scan_ids, [scan_id_col], "Scan table")
         scans = scan_ids.rename(columns={scan_id_col: "subjid"}) if scan_id_col != "subjid" else scan_ids.copy()

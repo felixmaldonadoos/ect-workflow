@@ -124,7 +124,10 @@ def build_parcel_summary(
     """Assemble per-scan rows after enforcing identical parcel columns."""
     if not (len(scans) == len(ordinary_rows) == len(weighted_rows) == len(size_rows) == len(count_rows) == len(qc_rows)):
         raise ValueError("Summary row counts do not match scan count")
-    index = pd.Index(scans["subjid"].astype(str), name="subjid")
+    key = "simulation_id" if "simulation_id" in scans else "subjid"
+    index = pd.Index(scans[key].astype(str), name=key)
+    if index.has_duplicates:
+        raise ValueError(f"Parcel summary requires unique {key} values")
     frames = [pd.DataFrame(rows, index=index) for rows in (ordinary_rows, weighted_rows, size_rows, count_rows)]
     expected = frames[0].columns
     for name, frame in zip(("weighted P95", "parcel size", "parcel count"), frames[1:], strict=True):

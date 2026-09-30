@@ -20,6 +20,7 @@ from simnibs_parcel_analysis import (
 )
 from simnibs_parcel_analysis.clinical import prepare_scan_course_outcomes
 from simnibs_parcel_analysis.identifiers import infer_subject_id
+from simnibs_parcel_analysis.mesh_io import build_hdf5_inventory
 from simnibs_parcel_analysis.pca import (
     DEMEAN_REFERENCES,
     DemeanReference,
@@ -163,12 +164,13 @@ def combine_parcel_summaries(summaries: Sequence[ParcelSummary]) -> ParcelSummar
     scans = pd.concat([summary.scans for summary in summaries], ignore_index=True)
     if "subjid" not in scans.columns:
         raise KeyError("Combined scans table is missing 'subjid'")
-    if scans["subjid"].duplicated().any():
-        duplicates = scans.loc[scans["subjid"].duplicated(keep=False), "subjid"].unique().tolist()
-        raise ValueError(f"Duplicate modeled-scan IDs in combined scans: {duplicates}")
+    key = "simulation_id" if "simulation_id" in scans else "subjid"
+    if scans[key].duplicated().any():
+        duplicates = scans.loc[scans[key].duplicated(keep=False), key].unique().tolist()
+        raise ValueError(f"Duplicate {key} values in combined scans: {duplicates}")
 
-    matrix_ids = pd.Index(p95_unweighted.index.astype(str), name="subjid")
-    scan_ids = pd.Index(scans["subjid"].astype(str), name="subjid")
+    matrix_ids = pd.Index(p95_unweighted.index.astype(str), name=key)
+    scan_ids = pd.Index(scans[key].astype(str), name=key)
     missing_scans = matrix_ids.difference(scan_ids).tolist()
     extra_scans = scan_ids.difference(matrix_ids).tolist()
 
@@ -178,8 +180,8 @@ def combine_parcel_summaries(summaries: Sequence[ParcelSummary]) -> ParcelSummar
             f"missing={missing_scans}, extra={extra_scans}"
         )
 
-    scans["subjid"] = scans["subjid"].astype(str)
-    scans = scans.set_index("subjid", drop=False).loc[matrix_ids].reset_index(drop=True)
+    scans[key] = scans[key].astype(str)
+    scans = scans.set_index(key, drop=False).loc[matrix_ids].reset_index(drop=True)
 
     qc_columns = first.qc.columns
     for number, summary in enumerate(summaries[1:], start=2):
@@ -216,6 +218,7 @@ def build_global_e_statistics(
     mesh_key: str = "mesh_roi",
     brain_tags: Sequence[int] = (1, 2),
     percentile: float = 95.0,
+    simulation_ids: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """Calculate ordinary P95 and arithmetic mean E over selected brain tetrahedra."""
     import simnibs
@@ -240,18 +243,9 @@ def build_global_e_statistics(
         raise ValueError("brain_tags cannot be empty")
 
     brain_tags = tuple(int(tag) for tag in brain_tags)
-    subject_ids = [infer_subject_id(path) for path in hdf5_files]
-    subject_index = pd.Index(subject_ids, name="subjid")
-
-    if subject_index.has_duplicates:
-        duplicates = (
-            subject_index[
-                subject_index.duplicated()
-            ].unique().tolist()
-        )
-        raise ValueError(
-            f"Duplicate modeled-scan IDs in hdf5_files: {duplicates}"
-        )
+    inventory = build_hdf5_inventory(hdf5_files, simulation_ids=simulation_ids)
+    key = "simulation_id" if simulation_ids is not None else "subjid"
+    subject_ids = inventory[key].tolist()
 
     global_p95_values = {}
     global_mean_values = {}
@@ -377,10 +371,10 @@ def build_global_e_statistics(
         name=f"global_p{percentile:g}_E",
         dtype=float,
     )
-    global_p95_e.index.name = "subjid"
+    global_p95_e.index.name = key
 
     global_mean_e = pd.Series(global_mean_values, name="global_mean_brain_E", dtype=float)
-    global_mean_e.index.name = "subjid"
+    global_mean_e.index.name = key
     return pd.concat([global_p95_e, global_mean_e], axis=1)
 
 
@@ -412,6 +406,7 @@ def run_global_p95_weighted_pca_outcome_analysis(
     global_percentile: float = 95.0,
     brain_tags: Sequence[int] = (1, 2),
     exclude_roi_names: Sequence[str] = (),
+    course_hdf5_map: pd.DataFrame | None = None,
 ) -> GlobalP95WeightedAnalysisResult:
     """Run one atlas analysis using global-P95-weighted PCA."""
     output_dir = Path(output_dir)
@@ -425,6 +420,7 @@ def run_global_p95_weighted_pca_outcome_analysis(
         summary.scans,
         cognitive,
         outcome_col=outcome_col,
+        course_hdf5_map=course_hdf5_map,
     )
 
     missing_global = parcel_values.index.difference(
@@ -592,9 +588,10 @@ def run_global_p95_weighted_pca_outcome_analysis(
             "treatment course; subjects may have multiple courses"
         ),
         "predictor_matching": (
-            "each modeled scan is matched to every treatment course "
-            "sharing subjid_base"
+            "explicit per-course modal-placement HDF5 assignment" if course_hdf5_map is not None
+            else "each modeled scan is matched to every treatment course sharing subjid_base"
         ),
+        "pca_row_identity": "simulation_id" if course_hdf5_map is not None else "subjid",
         "unmatched_scans": (
             "retained in ROI/PCA outputs and excluded from "
             "outcome correlations"
@@ -771,6 +768,8 @@ def run_all_atlases_global_p95_weighted(
     exclude_volume_rois_by_atlas: Mapping[str, Sequence[str]] | None = None,
     min_volume_elements_per_roi: int = 10,
     demean_references: Sequence[DemeanReference] = (),
+    simulation_ids: Sequence[str] | None = None,
+    course_hdf5_map: pd.DataFrame | None = None,
 ) -> dict[str, GlobalP95WeightedAnalysisResult | AnalysisResult]:
     
     """Run the existing analyses and optionally add separately exported demeaning modes."""
@@ -795,6 +794,16 @@ def run_all_atlases_global_p95_weighted(
         hdf5_files,
         subjects_dir_by_hdf5,
     )
+    if (simulation_ids is None) != (course_hdf5_map is None):
+        raise ValueError("simulation_ids and course_hdf5_map must be provided together")
+    if simulation_ids is not None:
+        validated = build_hdf5_inventory(hdf5_files, simulation_ids=simulation_ids)
+        simulation_ids = validated["simulation_id"].tolist()
+    id_by_path = dict(zip(hdf5_files, simulation_ids, strict=True)) if simulation_ids is not None else None
+    if subject_map is not None:
+        unknown = sorted(set(subject_map).difference(infer_subject_id(path) for path in hdf5_files))
+        if unknown:
+            raise ValueError(f"subject_map contains modeled IDs absent from selected HDF5s: {unknown}")
 
     if outcome_col not in cognitive.columns:
         cognitive = compute_cgi_change(
@@ -826,6 +835,11 @@ def run_all_atlases_global_p95_weighted(
             "subjects_dir": [expected_subjects_dirs[str(path)] for path in hdf5_files],
         }
     )
+    if simulation_ids is not None:
+        input_sources["simulation_id"] = simulation_ids
+        # Validate all joins before loading expensive meshes or writing analyses.
+        prepare_scan_course_outcomes(input_sources, cognitive, outcome_col=outcome_col, course_hdf5_map=course_hdf5_map)
+        course_hdf5_map.to_csv(output_dir / "course_hdf5_mapping.csv", index=False)
 
     input_sources.to_csv(
         output_dir / "model_input_sources.csv",
@@ -846,6 +860,7 @@ def run_all_atlases_global_p95_weighted(
         mesh_key=mesh_key,
         brain_tags=brain_tags,
         percentile=global_percentile,
+        simulation_ids=simulation_ids,
     )
     global_p95_e = global_statistics[f"global_p{global_percentile:g}_E"]
     global_mean_brain_e = global_statistics["global_mean_brain_E"]
@@ -864,6 +879,7 @@ def run_all_atlases_global_p95_weighted(
                     p95_method=method, outcome_col=outcome_col, demean_by=reference,
                     global_mean_brain_e=global_mean_brain_e, brain_tags=brain_tags, field_name=field_name,
                     variance_thresholds=(0.96, 0.97, 0.98, 0.99), pc_correlation_threshold=0.96,
+                    course_hdf5_map=course_hdf5_map,
                 )
 
     for atlas_name in volume_atlas_names:
@@ -883,7 +899,10 @@ def run_all_atlases_global_p95_weighted(
                     source_hdf5_files,
                     subjects_dir,
                     atlas_name=atlas_name,
-                    subject_map=subject_map,
+                    subject_map=({key: value for key, value in subject_map.items()
+                                  if key in {infer_subject_id(path) for path in source_hdf5_files}}
+                                 if subject_map is not None else None),
+                    simulation_ids=[id_by_path[path] for path in source_hdf5_files] if id_by_path is not None else None,
                     freesurfer_lut=freesurfer_lut,
                     field_name=field_name,
                     mesh_key=mesh_key,
@@ -913,6 +932,7 @@ def run_all_atlases_global_p95_weighted(
             global_percentile=global_percentile,
             brain_tags=brain_tags,
             exclude_roi_names=exclude_roi_names,
+            course_hdf5_map=course_hdf5_map,
         )
 
         if run_unweighted_sensitivity:
@@ -932,6 +952,7 @@ def run_all_atlases_global_p95_weighted(
                 global_percentile=global_percentile,
                 brain_tags=brain_tags,
                 exclude_roi_names=exclude_roi_names,
+                course_hdf5_map=course_hdf5_map,
             )
 
         add_demeaned_analyses(summary, f"volume_{atlas_name}", output_dir / f"volume_{atlas_name}")
@@ -939,6 +960,7 @@ def run_all_atlases_global_p95_weighted(
     if include_surface_hcp:
         hcp_summary = build_surface_roi_summary(
             hdf5_files,
+            simulation_ids=simulation_ids,
             atlas_name="HCP_MMP1",
             field_name=field_name,
             percentile=95,
@@ -960,6 +982,7 @@ def run_all_atlases_global_p95_weighted(
             pc_correlation_threshold=0.96,
             global_percentile=global_percentile,
             brain_tags=brain_tags,
+            course_hdf5_map=course_hdf5_map,
         )
 
         if run_unweighted_sensitivity:
@@ -978,6 +1001,7 @@ def run_all_atlases_global_p95_weighted(
                 pc_correlation_threshold=0.96,
                 global_percentile=global_percentile,
                 brain_tags=brain_tags,
+                course_hdf5_map=course_hdf5_map,
             )
 
         add_demeaned_analyses(hcp_summary, "surface_HCP_MMP1", output_dir / "surface_HCP_MMP1")

@@ -500,6 +500,7 @@ def correlate_predictors(
                 "predictor": predictor_name,
                 "n_observations": len(x),
                 "n_scans": aligned[subject_col].nunique(),
+                **({"n_simulations": aligned["simulation_id"].nunique()} if predictors.index.name == "simulation_id" else {}),
                 "n_treatment_courses": n_courses,
                 "n_people": n_people,
                 "r": float(result.statistic),
@@ -523,7 +524,8 @@ def expand_predictors_to_courses(
     outcome_col: str = "cgi_change",
     observation_col: str = "observation_id",
 ) -> pd.DataFrame:
-    """Attach one scan-level predictor row to every matched treatment course."""
+    """Attach predictors by simulation_id when present, retaining canonical scan IDs."""
+    subject_col = "simulation_id" if predictors.index.name == "simulation_id" else subject_col
     if predictors.index.has_duplicates:
         duplicates = predictors.index[
             predictors.index.duplicated()

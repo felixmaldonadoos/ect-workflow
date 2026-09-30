@@ -223,6 +223,7 @@ def build_volume_roi_summary(
     *,
     atlas_name: str = "aparc",
     subject_ids: Sequence[str] | None = None,
+    simulation_ids: Sequence[str] | None = None,
     subject_map: Mapping[str, str] | None = None,
     field_name: str = "magnE_mean",
     percentile: float = 95,
@@ -241,7 +242,8 @@ def build_volume_roi_summary(
 
     """Calculate anatomical parcel P95 values from HDF5 volume meshes."""
     canonical = canonical_volume_atlas_name(atlas_name)
-    scans = build_hdf5_inventory(hdf5_files, subject_ids=subject_ids, require_files=mesh_loader is None)
+    scans = build_hdf5_inventory(hdf5_files, subject_ids=subject_ids, simulation_ids=simulation_ids,
+                                 require_files=mesh_loader is None)
     scans = resolve_freesurfer_subjects(scans, subjects_dir, subject_map=subject_map)
     scans["atlas_file"] = [str(resolve_volume_atlas_path(path, canonical)) for path in scans["fs_subject_dir"]]
     if lut is None:

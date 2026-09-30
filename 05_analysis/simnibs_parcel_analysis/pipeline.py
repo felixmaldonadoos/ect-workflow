@@ -57,12 +57,14 @@ def run_pca_outcome_analysis(
     global_mean_brain_e: pd.Series | None = None,
     brain_tags: Sequence[int] = (1, 2),
     field_name: str = "magnE_mean",
+    course_hdf5_map: pd.DataFrame | None = None,
 ) -> AnalysisResult:
     """Fit the requested PCA, correlate global/PC predictors, and save outputs."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     parcel_values = summary.p95(p95_method)
-    outcomes = prepare_scan_course_outcomes(summary.scans, cognitive, outcome_col=outcome_col)
+    outcomes = prepare_scan_course_outcomes(summary.scans, cognitive, outcome_col=outcome_col,
+                                           course_hdf5_map=course_hdf5_map)
     if demean_by is None:
         pca_result = fit_parcel_pca(parcel_values)
     else:
@@ -125,7 +127,9 @@ def run_pca_outcome_analysis(
         "brain_mean_domain": "volume brain tetrahedra, including for surface PCA" if demean_by == "brain_mean" else None,
         "multiple_testing_family": "global predictors and selected PCs within this atlas/P95/preprocessing run",
         "clinical_observation": "one treatment course per unique (subjid_base, date_start)",
-        "predictor_matching": "each modeled scan is matched to every treatment course sharing subjid_base",
+        "predictor_matching": ("explicit per-course modal-placement HDF5 assignment" if course_hdf5_map is not None
+                               else "each modeled scan is matched to every treatment course sharing subjid_base"),
+        "pca_row_identity": "simulation_id" if course_hdf5_map is not None else "subjid",
         "unmatched_scans": "retained in ROI/PCA outputs and excluded from outcome correlations",
         "correlation": "scan-course Pearson; repeated scans and repeated courses within people are not independent",
     }
