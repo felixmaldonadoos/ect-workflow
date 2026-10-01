@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).with_name("build_subject_scan_map.py")
+SCRIPT = Path(__file__).resolve().parents[1] / "build_subject_scan_map.py"
 HEADER = ["subject_dir", "full_file_path", "model_type_dir", "step", "dataset_root"]
 
 

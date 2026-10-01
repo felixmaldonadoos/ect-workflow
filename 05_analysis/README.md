@@ -1,5 +1,10 @@
 # SimNIBS anatomical ROI and PCA analysis
 
+For the separate session-exposure/course-outcome mixed-model pipeline, see
+[LMM_README.md](LMM_README.md) and `run_lmm.py`. It preserves each session's
+actual placement and can export per-patient session x ROI matrices scaled by
+the legacy `ef_sf` index.
+
 This package analyzes `magnE_mean` stored in the `mesh_roi` group of SimNIBS
 gPC HDF5 files. It supports two anatomically distinct workflows:
 

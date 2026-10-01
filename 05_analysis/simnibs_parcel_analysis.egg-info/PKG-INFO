@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: simnibs-parcel-analysis
+Version: 0.2.0
+Summary: Anatomical atlas ROI, PCA, and outcome analysis for SimNIBS gPC HDF5 results
+Requires-Python: >=3.10
+Requires-Dist: matplotlib
+Requires-Dist: nibabel
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scikit-learn
+Requires-Dist: scipy
+Requires-Dist: simnibs<5,>=4.6
+Provides-Extra: lmm
+Requires-Dist: statsmodels<0.15,>=0.14.6; extra == "lmm"
+Requires-Dist: openpyxl>=3.1; extra == "lmm"

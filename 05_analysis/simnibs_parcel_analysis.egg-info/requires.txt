@@ -1,0 +1,11 @@
+matplotlib
+nibabel
+numpy
+pandas
+scikit-learn
+scipy
+simnibs<5,>=4.6
+
+[lmm]
+statsmodels<0.15,>=0.14.6
+openpyxl>=3.1

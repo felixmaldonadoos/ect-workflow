@@ -17,5 +17,8 @@ dependencies = [
     "simnibs>=4.6,<5",
 ]
 
+[project.optional-dependencies]
+lmm = ["statsmodels>=0.14.6,<0.15", "openpyxl>=3.1"]
+
 [tool.setuptools]
 packages = ["simnibs_parcel_analysis"]
