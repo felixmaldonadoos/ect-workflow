@@ -1,5 +1,4 @@
 """Clinical, demographic, and stimulation-data preparation."""
-
 from __future__ import annotations
 
 import json
@@ -7,11 +6,80 @@ from numbers import Real
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
 import warnings
-
 import numpy as np
 import pandas as pd
-
 from .identifiers import add_subject_id_columns, base_subject_id, build_scan_table
+from collections.abc import Sequence
+
+DEFAULT_MODE_COLUMNS = ('electrode_placement', 'pulse_width_ms', 'frequency_hz', 'percent_charge')
+
+def _single_mode(values: pd.Series) -> object:
+    modes = values.mode()
+    if len(modes) != 1:
+        raise ValueError(f'No unique mode for {values.name}: {modes.tolist()}')
+    return modes.iloc[0]
+
+"""Summarize mapped ECT sessions using one modal value per course parameter.
+
+Notebook usage:
+    from summarize_treatment_courses import summarize_treatment_courses
+    courses = summarize_treatment_courses(mapped)
+
+Courses are identified by the original subjid and series_num, without changing
+subject IDs. All series are retained. Session order does not affect the mode.
+Parameters are summarized independently; their modes need not form a parameter
+combination that occurred in any one session. CGI outcomes remain in the separate
+course table and are not aggregated here. No simulation files are opened.
+"""
+
+def summarize_treatment_courses(sessions: pd.DataFrame, *, mode_columns: Sequence[str] = DEFAULT_MODE_COLUMNS,
+                                session_column: str | None = None) -> pd.DataFrame:
+    """Return subjid, series_num, n_sessions, and one mode for each requested column.
+
+    Accept either session_number or the older session_num automatically when
+    exactly one exists; otherwise choose explicitly with session_column.
+    n_sessions counts observed sessions, even when sequence numbers have gaps.
+    Missing values, duplicate sessions, and tied modes raise errors. The input
+    DataFrame is unchanged. Placement labels are stripped and uppercased in the
+    summary. Outcome values and full_file_path are not included automatically.
+    """
+    if not isinstance(sessions, pd.DataFrame):
+        raise TypeError('sessions must be a pandas DataFrame.')
+    if sessions.columns.has_duplicates:
+        raise ValueError('Sessions contain duplicate column names.')
+    if isinstance(mode_columns, str):
+        raise TypeError('mode_columns must be a sequence of column names, not one string.')
+    mode_columns = tuple(mode_columns)
+    keys = ('subjid', 'series_num')
+    if (not mode_columns or any(not isinstance(column, str) or not column for column in mode_columns)
+            or len(set(mode_columns)) != len(mode_columns)
+            or set(mode_columns).intersection((*keys, 'n_sessions'))):
+        raise ValueError('Provide unique mode column names distinct from subjid, series_num, and n_sessions.')
+    if session_column is None:
+        available = [name for name in ('session_number', 'session_num') if name in sessions.columns]
+        if len(available) != 1:
+            raise ValueError('Provide session_column, or exactly one of session_number and session_num.')
+        session_column = available[0]
+    if session_column in (*keys, 'n_sessions', *mode_columns):
+        raise ValueError('The session sequence column must be distinct from course keys and mode columns.')
+    required = list(dict.fromkeys((*keys, session_column, *mode_columns)))
+    if missing := set(required).difference(sessions.columns):
+        raise KeyError(f'Missing columns: {sorted(missing)}')
+    for column in required:
+        values = sessions[column]
+        blank = values.map(lambda value: isinstance(value, str) and not value.strip())
+        if (values.isna() | blank).any():
+            raise ValueError(f'Missing values in {column}; explicitly filter or resolve these rows first.')
+    if sessions.duplicated([*keys, session_column]).any():
+        raise ValueError('Duplicate session numbers within a subjid/series_num course.')
+    frame = sessions.copy(deep=True)
+    if 'electrode_placement' in mode_columns:
+        placements = frame['electrode_placement']
+        if not placements.map(lambda value: isinstance(value, str)).all():
+            raise ValueError('electrode_placement must contain string labels.')
+        frame['electrode_placement'] = placements.str.strip().str.upper()
+    return frame.groupby(list(keys), as_index=False, sort=False, observed=True).agg(
+        n_sessions=(session_column, 'nunique'), **{column: (column, _single_mode) for column in mode_columns})
 
 
 def load_ect_sessions(
@@ -43,7 +111,7 @@ def load_hdf5_query(
     fn: str | Path | pd.DataFrame,
     *,
     model_type: Literal["skin_single", "skin_double"],
-    simulation_type: Literal["static", "adaptive", "step_0", "step_2"],
+    simulation_type: Literal["static", "adaptive", "step_0", "step_5"],
     query_filters: Mapping[str, str | int] | None = None,
 ) -> pd.DataFrame:
     """Select HDF5 records from a query CSV or an already loaded query table.

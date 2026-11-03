@@ -23,7 +23,6 @@ Aggregation = Literal["sum", "mean"]
 DOSE_COLUMNS = ("ef_sf", "percent_charge")
 SESSION_KEYS = ["subjid_base", "series_num", "session_num"]
 
-
 @dataclass(frozen=True)
 class CourseLink:
     sessions: pd.DataFrame
@@ -165,7 +164,6 @@ def _incomplete_course_sessions(sessions: pd.DataFrame, courses: pd.DataFrame, e
             series = candidates[0]
         mask |= patient & sessions["series_num"].eq(series)
     return mask
-
 
 def link_sessions_to_courses(
     sessions: pd.DataFrame, outcomes: pd.DataFrame, *, allow_unmatched_sessions: bool = False,

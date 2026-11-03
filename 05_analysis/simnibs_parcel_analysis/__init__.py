@@ -24,6 +24,7 @@ from .clinical import (
     prepare_scan_course_outcomes,
     prepare_scan_outcomes,
     validate_treatment_courses,
+    summarize_treatment_courses
 )
 from .identifiers import (
     add_subject_id_columns,
@@ -60,6 +61,7 @@ from .pca import (
 from .pipeline import AnalysisResult, run_pca_outcome_analysis
 from .summary import P95Method, ParcelSummary, global_metrics_from_parcels, weighted_percentile
 from .identifiers import infer_subject_id
+from .utils import prepare_session_file_table
 
 __all__ = [
     "DEMEAN_REFERENCES",
@@ -117,4 +119,6 @@ __all__ = [
     "subject_id_from_path",
     "weighted_percentile",
     "validate_treatment_courses",
+    "prepare_session_file_table",
+    "summarize_treatment_courses"
 ]

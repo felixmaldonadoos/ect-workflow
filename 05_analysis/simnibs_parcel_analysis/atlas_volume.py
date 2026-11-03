@@ -238,6 +238,7 @@ def build_volume_roi_summary(
     mesh_to_atlas_ras: np.ndarray | Mapping[str, np.ndarray] | None = None,
     mesh_loader: Callable | None = None,
     atlas_loader: Callable[[str | Path], tuple[np.ndarray, np.ndarray]] | None = None,
+    negative_atol: float = 1e-8,
     lut: Mapping[int, str] | None = None) -> ParcelSummary:
 
     """Calculate anatomical parcel P95 values from HDF5 volume meshes."""
@@ -262,7 +263,17 @@ def build_volume_roi_summary(
     expected_rois = None
     for row in scans.itertuples(index=False):
         mesh = load_hdf5_mesh(row.hdf5_file, mesh_key=mesh_key, mesh_loader=mesh_loader)
-        field, _ = scalar_mesh_field(mesh, field_name, expected_location="element")
+
+        try:
+            field, _ = scalar_mesh_field(
+                mesh,
+                field_name,
+                expected_location="element",
+                negative_atol=negative_atol,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{row.hdf5_file}: {exc}") from exc
+        
         centers, sizes, element_types = element_geometry(mesh)
         tetrahedra = element_types == 4
         if not tetrahedra.any():
