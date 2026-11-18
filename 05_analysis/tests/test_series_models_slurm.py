@@ -60,8 +60,10 @@ class TestSeriesSlurmSubmission(unittest.TestCase):
         args = json.loads(self.capture.read_text())
         self.assertEqual(args[args.index("--master-path") + 1], str(self.master.resolve()))
         self.assertIn(f"--chdir={SOURCE}", args)
-        self.assertIn(f"--output={self.results}/test_run/logs/%j.out", args)
-        self.assertTrue((self.results / "test_run/logs").is_dir())
+        self.assertIn(f"--output={self.results}/lmm/test_run/logs/%x_%j.out", args)
+        self.assertEqual(args[args.index("--analysis-name") + 1], "lmm/test_run")
+        self.assertIn("--job-name=test_run", args)
+        self.assertTrue((self.results / "lmm/test_run/logs").is_dir())
 
     def test_equals_spelling_and_feature_names_with_spaces_are_preserved(self):
         completed = self.run_wrapper([

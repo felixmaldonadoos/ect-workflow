@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=3G
-#SBATCH --time=00:5:00
+#SBATCH --mem=1G
+#SBATCH --time=00:4:00
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 

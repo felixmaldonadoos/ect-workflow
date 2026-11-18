@@ -28,7 +28,7 @@ enables plotting, preserving the full runner's existing behavior. The full
 workflow performs these steps in order:
 
 1. Build the raw ROI master from the clinical/query tables and NIfTI fields.
-2. Write a separate master normalized by each field's whole-brain mean.
+2. Write a separate master normalized by each GM/WM-only field's nonzero mean.
 3. Run regular and permutation correlations on the raw master.
 4. Run regular and permutation correlations on the normalized master.
 5. Plot each variant's permutation results when plotting is enabled.
@@ -75,7 +75,8 @@ absolute Slurm `--output` and `--error` paths. The job files use `/dev/null`
 placeholders for those directives; submit through the wrapper to retain logs.
 `YEO_VALIDATE_PYTHON` can select the stdlib Python used for path validation.
 `YEO_CONDA_SH` and `YEO_CONDA_ENV` can override the Conda initialization file
-and environment. `BRAIN_MASK` can override the full runner's default mask.
+and environment. Normalization uses the GM/WM-only field itself and does not
+require an external MNI brain mask.
 
 ## Output layout
 
@@ -134,24 +135,44 @@ stimulation row. Unique field files are extracted once and their statistics
 are attached to every matching series. Each treatment series is treated as an
 independent sample in correlations, including multiple series from one person.
 
-The normalization step uses the positive voxels of:
+Normalization expects MNI field NIfTIs already restricted to GM and WM
+(SimNIBS tissue labels 1 and 2), with zero encoding excluded tissue/background.
+For each unique input file, it validates that every value is finite, selects
+`field != 0`, and calculates the arithmetic mean of those selected values:
 
 ```text
-/projects/p32903/Alex2/ecstim/resources/templates/MNI152_T1_1mm_brain.nii.gz
+mean_values_gmwm = mean(field_nifti_values_gmwm[field_nifti_values_gmwm != 0])
+normalized_field_values = field_nifti_values_gmwm / mean_values_gmwm
 ```
 
-It resamples the binary mask to each field image's grid with nearest-neighbor
-interpolation, calculates the arithmetic field mean inside that mask, then
-sets `mean = mean_raw / whole_brain_mean` in a separate master CSV. Zero-valued
-field voxels inside the mask are included. A non-finite or nonpositive
-whole-brain mean raises an error. Inputs must already occupy compatible MNI
-coordinates; grid resampling does not perform anatomical registration.
+The pipeline applies the equivalent regional calculation
+`mean = mean_raw / mean_values_gmwm` in a separate master CSV. Dividing every
+voxel by the same scalar before taking an ROI mean gives the same result as
+dividing that ROI's raw mean by the scalar. No additional normalized NIfTI is
+written. The Yeo atlas's voxel selection and its inclusion of zero-valued
+field voxels in raw ROI statistics are unchanged.
+The raw master must be rebuilt from the same GM/WM-only inputs; the full
+runner performs that preparation before normalization.
+
+No external template is loaded, no brain-mask resampling is performed, and
+`--brain-mask` is no longer an argument to the normalizer. Foreground selection
+is recalculated per file even when two fields share a grid. An all-zero input,
+NaN/infinity anywhere in the field, or a nonpositive/nonfinite selected mean
+raises an error. A genuine zero-valued GM/WM voxel cannot be distinguished
+from background by `field != 0`; inputs must follow the stated zero-background
+convention.
 
 The normalized master retains the series/ROI metadata and adds `mean_raw`,
-`whole_brain_mean`, `whole_brain_n_voxels`, and normalization/mask provenance.
+`whole_brain_mean`, `whole_brain_n_voxels`, and normalization provenance.
+For compatibility, the existing `whole_brain_*` names and `brain_mean` method
+and filename tag are retained: the mean/count now refer to the input's nonzero
+GM/WM values. `normalization_domain=gmwm_nonzero`, an empty mask path, and an
+explicit `field != 0` rule distinguish these outputs from older template-mask
+normalization. Legacy tables retain their recorded mask provenance.
 Only `mean` is normalized; the other spatial statistics and `n_voxels` retain
 their raw meaning. Correlation and plot CSVs retain the normalization metadata
-and the path to their source table.
+and the path to their source table. Use a new analysis name, such as
+`mni_yeo2011_gmwm`, when running this method alongside historical results.
 
 ## Correlations and plots
 

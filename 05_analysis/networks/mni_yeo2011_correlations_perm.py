@@ -23,6 +23,7 @@ P-values are unadjusted. Missing/nonfinite values, constant features, duplicate
 ROI observations, and incomplete ROI coverage raise errors.
 
 Examples:
+    export RESULTS_DIR=/path/to/results
     python mni_yeo2011_correlations_perm.py
 
     python mni_yeo2011_correlations_perm.py \
@@ -33,7 +34,7 @@ Examples:
 
     python mni_yeo2011_correlations_perm.py \
         --master-path /path/to/master.csv \
-        --output-path /path/to/permutation_results.csv
+        --output-path "$RESULTS_DIR/mni_yeo2011/data/permutation_results.csv"
 
 Requires Python >= 3.10, numpy, pandas, and scipy >= 1.15.
 """
@@ -44,6 +45,20 @@ import math
 from pathlib import Path
 import re
 
+if __package__ in (None, ""):
+    from _results import (
+        add_analysis_argument, bootstrap_cli, correlation_output_path,
+        default_master_path, normalization_metadata, validate_output_path,
+    )
+else:
+    from ._results import (
+        add_analysis_argument, bootstrap_cli, correlation_output_path,
+        default_master_path, normalization_metadata, validate_output_path,
+    )
+
+if __name__ == "__main__":
+    bootstrap_cli()
+
 import numpy as np
 import pandas as pd
 import scipy
@@ -51,9 +66,6 @@ from scipy.stats import permutation_test, rankdata, spearmanr
 
 
 DEFAULT_FIELD_NAME = "magnE_mean"
-DEFAULT_MASTER_DIR = Path(
-    "/projects/p32903/Alex2/ect-workflow/05_analysis/networks/data"
-)
 NETWORKS = (
     "Vis",
     "SomMot",
@@ -277,6 +289,7 @@ def save_spearman_table(
     filename: str | Path,
 ) -> pd.DataFrame:
     """Save annotations and preserve every permutation parameter/result column."""
+    output_path = validate_output_path(filename)
     columns = [
         "x",
         "y",
@@ -304,7 +317,6 @@ def save_spearman_table(
     ]
     result = result[[*leading, *extra]]
 
-    output_path = Path(filename)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_path, index=False)
 
@@ -597,6 +609,7 @@ def parse_args(
     argv: list[str] | None = None,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Run Spearman correlations and permutation tests between "
             "cgi_change and ROI means, separately for every "
@@ -604,6 +617,7 @@ def parse_args(
         )
     )
 
+    add_analysis_argument(parser)
     parser.add_argument(
         "--field-name",
         default=DEFAULT_FIELD_NAME,
@@ -613,7 +627,7 @@ def parse_args(
         "--master-path",
         type=Path,
         help=(
-            f"Master CSV (default: {DEFAULT_MASTER_DIR}/"
+            "Master CSV (default: $RESULTS_DIR/<analysis-name>/data/"
             "yeo2011_<field-name>_series_ROI_master.csv)."
         ),
     )
@@ -621,8 +635,8 @@ def parse_args(
         "--output-path",
         type=Path,
         help=(
-            "Results CSV (default: field/scope-specific permutation "
-            "filename beside the selected master)."
+            "Results CSV inside $RESULTS_DIR/<analysis-name>/ "
+            "(default: normalization-aware permutation filename in data/)."
         ),
     )
     parser.add_argument(
@@ -676,9 +690,13 @@ def main(argv: list[str] | None = None) -> int:
 
     master_path = args.master_path
     if master_path is None:
-        master_path = DEFAULT_MASTER_DIR / (
-            f"yeo2011_{field_name}_series_ROI_master.csv"
-        )
+        master_path = default_master_path(args.analysis_name, field_name)
+
+    if args.output_path is not None:
+        validate_output_path(args.output_path, analysis_name=args.analysis_name)
+
+    master = load_roi_master(master_path)
+    metadata = normalization_metadata(master, field_name, source_path=master_path)
 
     include_network_means = not args.no_network_means
 
@@ -690,16 +708,16 @@ def main(argv: list[str] | None = None) -> int:
 
     output_path = args.output_path
     if output_path is None:
-        output_path = master_path.parent / (
-            f"spearman_{field_name}_{scope}_permutation_annotated.csv"
+        output_path = correlation_output_path(
+            args.analysis_name, field_name, scope, metadata, permutation=True,
         )
+
+    output_path = validate_output_path(output_path, analysis_name=args.analysis_name)
 
     if output_path.resolve() == master_path.resolve():
         raise ValueError(
             "Output path must differ from the input master CSV."
         )
-
-    master = load_roi_master(master_path)
 
     print(
         f"Loaded {len(master):,} ROI rows from {master_path}",
@@ -717,6 +735,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     results["master_path"] = str(master_path.resolve())
+    for column, value in metadata.items():
+        results[column] = value
 
     annotated = save_spearman_table(
         results,

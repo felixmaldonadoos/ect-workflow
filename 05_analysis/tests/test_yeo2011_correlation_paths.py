@@ -101,6 +101,8 @@ class TestYeoCorrelationPaths(unittest.TestCase):
         master_path = legacy / "arbitrary.csv"
         small_master().assign(
             normalization="brain_mean", normalization_tag=NORM_TAG,
+            normalization_domain="gmwm_nonzero",
+            normalization_mask_rule="field != 0; zeros excluded",
         ).to_csv(master_path, index=False)
         for module in MODULES:
             with self.subTest(module=module.__name__):
@@ -110,6 +112,8 @@ class TestYeoCorrelationPaths(unittest.TestCase):
                 self.assert_statistics(saved)
                 self.assertEqual(saved.normalization.unique().tolist(), ["brain_mean"])
                 self.assertEqual(saved.normalization_tag.unique().tolist(), [NORM_TAG])
+                self.assertEqual(saved.normalization_domain.unique().tolist(), ["gmwm_nonzero"])
+                self.assertEqual(saved.normalization_mask_rule.unique().tolist(), ["field != 0; zeros excluded"])
                 self.assertEqual(saved.master_path.unique().tolist(), [str(master_path.resolve())])
         self.assertEqual(list(legacy.iterdir()), [master_path])
 

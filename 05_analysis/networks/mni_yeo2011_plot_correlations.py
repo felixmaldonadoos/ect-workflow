@@ -25,6 +25,28 @@ import argparse
 from pathlib import Path
 import re
 
+if __package__ in (None, ""):
+    from _results import (
+        add_analysis_argument,
+        bootstrap_cli,
+        data_dir,
+        normalization_metadata,
+        plot_output_dir,
+        validate_output_path,
+    )
+else:
+    from ._results import (
+        add_analysis_argument,
+        bootstrap_cli,
+        data_dir,
+        normalization_metadata,
+        plot_output_dir,
+        validate_output_path,
+    )
+
+if __name__ == "__main__":
+    bootstrap_cli()
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -36,7 +58,6 @@ from nilearn import image, plotting
 
 
 BASE_DIR = Path("/projects/p32903/Alex2/ect-workflow")
-DATA_DIR = BASE_DIR / "05_analysis/networks/data"
 
 DEFAULT_ATLAS = (
     BASE_DIR
@@ -306,6 +327,39 @@ def build_plot_jobs(
     return jobs, set(regional_mapping.values()) | set(bilateral_mapping.values())
 
 
+def map_output_paths(
+    output_dir,
+    job,
+    *,
+    field_name,
+    metric,
+    outcome,
+    model_type,
+    step,
+    analysis_name=None,
+):
+    """Plan and validate every artifact before any map files are written."""
+    output_dir = validate_output_path(output_dir, analysis_name)
+    is_parent = job["family"] == "parent"
+    family_dir = "parent_network_maps" if is_parent else "overview_maps"
+    destination = validate_output_path(output_dir / family_dir, analysis_name)
+    suffix = job["plot_type"]
+    if is_parent:
+        suffix = f"parent_{job['network']}_{suffix}"
+    prefix = (
+        f"spearman_rho_field-{field_name}_metric-{metric}_"
+        f"{model_type}_{step}_{outcome}_{suffix}"
+    )
+    return {
+        key: validate_output_path(
+            destination / f"{prefix}{extension}", analysis_name
+        )
+        for key, extension in (
+            ("nifti", ".nii.gz"), ("png", ".png"), ("csv", ".csv")
+        )
+    }
+
+
 def save_map_set(
     table,
     job,
@@ -320,6 +374,7 @@ def save_map_set(
     model_type,
     step,
     dpi=300,
+    analysis_name=None,
 ):
     mapping = job["mapping"]
     features = list(dict.fromkeys(mapping.values()))
@@ -329,6 +384,17 @@ def save_map_set(
             f"{model_type}/{step}/{job['network']}: "
             f"missing features: {sorted(missing)}"
         )
+
+    paths = map_output_paths(
+        output_dir,
+        job,
+        field_name=field_name,
+        metric=metric,
+        outcome=outcome,
+        model_type=model_type,
+        step=step,
+        analysis_name=analysis_name,
+    )
 
     source = table.loc[features].copy()
     volume = np.zeros(labels.shape, dtype=np.float32)
@@ -344,25 +410,7 @@ def save_map_set(
     rho_img.header["cal_max"] = 1
 
     is_parent = job["family"] == "parent"
-    family_dir = (
-        "parent_network_maps" if is_parent else "overview_maps"
-    )
-    destination = Path(output_dir) / family_dir
-    destination.mkdir(parents=True, exist_ok=True)
-
-    suffix = job["plot_type"]
-    if is_parent:
-        suffix = f"parent_{job['network']}_{suffix}"
-
-    prefix = (
-        f"spearman_rho_field-{field_name}_metric-{metric}_"
-        f"{model_type}_{step}_{outcome}_{suffix}"
-    )
-    paths = {
-        "nifti": destination / f"{prefix}.nii.gz",
-        "png": destination / f"{prefix}.png",
-        "csv": destination / f"{prefix}.csv",
-    }
+    paths["nifti"].parent.mkdir(parents=True, exist_ok=True)
 
     rho_img.to_filename(paths["nifti"])
     source.reset_index().to_csv(paths["csv"], index=False)
@@ -441,9 +489,11 @@ def plot_correlation_configurations(
     plot_overviews=True,
     plot_parents=True,
     dpi=300,
+    analysis_name=None,
 ):
     if not plot_overviews and not plot_parents:
         raise ValueError("Enable at least one plot family.")
+    output_dir = validate_output_path(output_dir, analysis_name)
 
     selected = results.loc[
         results["field_name"].eq(field_name)
@@ -491,6 +541,16 @@ def plot_correlation_configurations(
                     f"{model_type}/{step}/{job['network']}: "
                     f"missing features: {sorted(missing)}"
                 )
+            map_output_paths(
+                output_dir,
+                job,
+                field_name=field_name,
+                metric=metric,
+                outcome=outcome,
+                model_type=model_type,
+                step=step,
+                analysis_name=analysis_name,
+            )
 
     records = []
 
@@ -516,14 +576,16 @@ def plot_correlation_configurations(
                     model_type=model_type,
                     step=step,
                     dpi=dpi,
+                    analysis_name=analysis_name,
                 )
             )
 
     return pd.DataFrame(records)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    add_analysis_argument(parser)
     parser.add_argument("--field-name", default="magnE_mean")
     parser.add_argument("--metric", default="mean")
     parser.add_argument("--outcome", default="cgi_change")
@@ -537,7 +599,10 @@ def parse_args():
     parser.add_argument(
         "--template-path", type=Path, default=DEFAULT_TEMPLATE
     )
-    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--output-dir", type=Path,
+        help="Plot directory under RESULTS_DIR/<analysis-name>/.",
+    )
     parser.add_argument(
         "--networks",
         nargs="+",
@@ -547,7 +612,7 @@ def parse_args():
     parser.add_argument("--no-parents", action="store_true")
     parser.add_argument("--dpi", type=int, default=300)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.no_overviews and args.no_parents:
         parser.error("Enable at least one plot family.")
@@ -557,27 +622,34 @@ def parse_args():
     return args
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
 
     correlations_path = args.correlations_path
     if correlations_path is None:
-        correlations_path = DATA_DIR / (
+        correlations_path = data_dir(args.analysis_name) / (
             f"spearman_{args.field_name}_ROImean_and_network_annotated.csv"
         )
+    correlations_path = correlations_path.expanduser().resolve()
 
     lut_path = args.lut_path
     if lut_path is None:
         lut_path = args.atlas_path.parent / "7Networks_ColorLUT_freeview.txt"
 
     output_dir = args.output_dir
-    if output_dir is None:
-        output_dir = correlations_path.parent / (
-            f"spearman_{args.field_name}_plots"
-        )
-    output_dir = output_dir.expanduser().resolve()
+    if output_dir is not None:
+        output_dir = validate_output_path(output_dir, args.analysis_name)
 
     results = load_correlation_results(correlations_path)
+    metadata = normalization_metadata(
+        results, args.field_name, source_path=correlations_path
+    )
+    if output_dir is None:
+        output_dir = plot_output_dir(args.analysis_name, metadata)
+    output_dir = validate_output_path(output_dir, args.analysis_name)
+    manifest_path = validate_output_path(
+        output_dir / "plot_manifest.csv", args.analysis_name
+    )
     print(
         f"Loaded {len(results):,} correlations from {correlations_path}",
         flush=True,
@@ -596,10 +668,13 @@ def main():
         plot_overviews=not args.no_overviews,
         plot_parents=not args.no_parents,
         dpi=args.dpi,
+        analysis_name=args.analysis_name,
     )
 
+    for column, value in metadata.items():
+        manifest[column] = value
     manifest["correlations_path"] = str(correlations_path.resolve())
-    manifest_path = output_dir / "plot_manifest.csv"
+    manifest_path = validate_output_path(manifest_path, args.analysis_name)
     manifest.to_csv(manifest_path, index=False)
 
     summary = (

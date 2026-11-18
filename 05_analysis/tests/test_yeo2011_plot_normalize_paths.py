@@ -38,12 +38,8 @@ class TestRoiNormalizationPaths(unittest.TestCase):
 
     def test_legacy_input_uses_canonical_results_output(self):
         field_path = self.root / "field.nii.gz"
-        mask_path = self.root / "mask.nii.gz"
         field = np.arange(8, dtype=np.float32).reshape((2, 2, 2))
-        mask = np.zeros_like(field)
-        mask[0] = 10
         nib.save(nib.Nifti1Image(field, np.eye(4)), field_path)
-        nib.save(nib.Nifti1Image(mask, np.eye(4)), mask_path)
         source_path = self.root / "legacy_master.csv"
         master = pd.DataFrame({
             "field_name": ["magnE_mean"] * 2,
@@ -56,17 +52,19 @@ class TestRoiNormalizationPaths(unittest.TestCase):
         master.to_csv(source_path, index=False)
         normalizer.main([
             "--analysis-name", "example", "--master-path", str(source_path),
-            "--brain-mask", str(mask_path),
         ])
         output = self.analysis / "data" / (
             "yeo2011_magnE_mean_series_ROI_master_"
             "normed_brain_magnE_mean_mean.csv"
         )
         saved = pd.read_csv(output)
-        np.testing.assert_allclose(saved["mean"], [2, 4])
+        np.testing.assert_allclose(saved["mean"], [0.75, 1.5])
         np.testing.assert_allclose(saved["mean_raw"], [3, 6])
-        np.testing.assert_allclose(saved["whole_brain_mean"], [1.5, 1.5])
-        self.assertEqual(saved["whole_brain_n_voxels"].tolist(), [4, 4])
+        # Background zero is excluded: mean(1, 2, ..., 7) = 4.
+        np.testing.assert_allclose(saved["whole_brain_mean"], [4, 4])
+        self.assertEqual(saved["whole_brain_n_voxels"].tolist(), [7, 7])
+        self.assertTrue(saved["normalization_domain"].eq("gmwm_nonzero").all())
+        self.assertTrue(saved["normalization_mask_path"].isna().all())
         self.assertEqual(saved["n_voxels"].tolist(), [2, 4])
         self.assertEqual(saved["series_num"].tolist(), [1, 2])
         self.assertTrue(saved["raw_master_path"].eq(str(source_path)).all())
@@ -74,6 +72,73 @@ class TestRoiNormalizationPaths(unittest.TestCase):
         self.assertFalse(source_path.with_name(
             "legacy_master_normed_brain_magnE_mean_mean.csv"
         ).exists())
+
+    def test_same_grid_fields_use_their_own_support_and_each_path_loads_once(self):
+        first = self.root / "first.nii.gz"
+        second = self.root / "second.nii.gz"
+        nib.save(nib.Nifti1Image(np.array([2, 4, 0, 0, 0, 0, 0, 0], dtype=float)
+                                .reshape((2, 2, 2)), np.eye(4)), first)
+        nib.save(nib.Nifti1Image(np.array([0, 0, 0, 8, 0, 0, 0, 0], dtype=float)
+                                .reshape((2, 2, 2)), np.eye(4)), second)
+        master = pd.DataFrame({
+            "field_name": ["magnE_mean"] * 4,
+            "full_file_path": [str(first), str(second), str(first), str(second)],
+            "mean": [3.0, 8.0, 6.0, 4.0],
+        })
+        with patch.object(normalizer, "load_scalar_img", wraps=normalizer.load_scalar_img) as load:
+            normalized = normalizer.normalize_master(master)
+        self.assertEqual(load.call_count, 2)
+        self.assertEqual({call.args[0] for call in load.call_args_list}, {str(first), str(second)})
+        np.testing.assert_allclose(normalized["whole_brain_mean"], [3, 8, 3, 8])
+        self.assertEqual(normalized["whole_brain_n_voxels"].tolist(), [2, 1, 2, 1])
+        np.testing.assert_allclose(normalized["mean"], [1, 1, 2, 0.5])
+
+    def test_singleton_fourth_dimension_is_supported(self):
+        path = self.root / "singleton.nii.gz"
+        values = np.array([0, 2, 6, 0, 0, 0, 0, 0], dtype=float).reshape((2, 2, 2, 1))
+        nib.save(nib.Nifti1Image(values, np.eye(4)), path)
+        normalized = normalizer.normalize_master(pd.DataFrame({
+            "field_name": ["magnE_mean"], "full_file_path": [str(path)], "mean": [8.0],
+        }))
+        self.assertEqual(normalized["whole_brain_mean"].iloc[0], 4)
+        self.assertEqual(normalized["whole_brain_n_voxels"].iloc[0], 2)
+        self.assertEqual(normalized["mean"].iloc[0], 2)
+
+    def test_roi_mean_division_matches_dividing_voxels_with_roi_zeros_retained(self):
+        path = self.root / "field.nii.gz"
+        field = np.array([0, 2, 4, 6, 0, 0, 0, 0], dtype=float).reshape((2, 2, 2))
+        nib.save(nib.Nifti1Image(field, np.eye(4)), path)
+        master = pd.DataFrame({
+            "field_name": ["magnE_mean"] * 2, "full_file_path": [str(path)] * 2,
+            "mean": [2.0, 3.0], "n_voxels": [3, 2], "median": [2.0, 3.0],
+        })
+        normalized = normalizer.normalize_master(master)
+        # Nonzero GM+WM values (2, 4, 6) have mean 4. The ROI means
+        # still include their own background zeros, as extraction does today.
+        divided_voxels = field.ravel() / 4
+        expected = [divided_voxels[[0, 1, 2]].mean(), divided_voxels[[3, 4]].mean()]
+        np.testing.assert_allclose(normalized["mean"], expected)
+        np.testing.assert_allclose(normalized["whole_brain_mean"], [4, 4])
+        self.assertEqual(normalized["n_voxels"].tolist(), [3, 2])
+        np.testing.assert_allclose(normalized["median"], master["median"])
+
+    def test_empty_nonfinite_and_nonpositive_gmwm_means_are_rejected(self):
+        path = self.root / "invalid.nii.gz"
+        master = pd.DataFrame({
+            "field_name": ["magnE_mean"], "full_file_path": [str(path)], "mean": [1.0],
+        })
+        cases = {
+            "all zero": [0, 0], "NaN": [2, np.nan],
+            "positive infinity": [2, np.inf], "negative infinity": [2, -np.inf],
+            "negative mean": [-2, -4], "zero mean": [-2, 2],
+            "overflowing mean": [1e308, 1e308],
+        }
+        for label, values in cases.items():
+            with self.subTest(label=label):
+                field = np.array([*values, 0, 0, 0, 0, 0, 0], dtype=float).reshape((2, 2, 2))
+                nib.save(nib.Nifti1Image(field, np.eye(4)), path)
+                with self.assertRaises(ValueError), np.errstate(over="ignore"):
+                    normalizer.normalize_master(master)
 
     def test_reject_output_escape_before_reading_images_or_csv(self):
         for output in (
@@ -167,6 +232,9 @@ class TestRoiPlotPaths(unittest.TestCase):
                 frame = self.results_frame.copy()
                 frame["normalization"] = normalization
                 frame["normalization_tag"] = tag
+                if normalization == "brain_mean":
+                    frame["normalization_domain"] = "gmwm_nonzero"
+                    frame["normalization_mask_rule"] = "field != 0"
                 source = self.root / f"legacy_{tag}.csv"
                 frame.to_csv(source, index=False)
                 with patch.object(
@@ -182,6 +250,9 @@ class TestRoiPlotPaths(unittest.TestCase):
                 self.assertEqual(len(manifest), 2)
                 self.assertTrue(manifest["normalization_tag"].eq(tag).all())
                 self.assertTrue(manifest["correlations_path"].eq(str(source)).all())
+                if normalization == "brain_mean":
+                    self.assertTrue(manifest["normalization_domain"].eq("gmwm_nonzero").all())
+                    self.assertTrue(manifest["normalization_mask_rule"].eq("field != 0").all())
                 for row in manifest.itertuples():
                     for filename in (row.csv, row.png, row.nifti):
                         self.assertTrue(Path(filename).is_file())
@@ -189,6 +260,9 @@ class TestRoiPlotPaths(unittest.TestCase):
                     saved = pd.read_csv(row.csv)
                     self.assertTrue(saved["n_permutations"].eq(9999).all())
                     self.assertTrue(saved["permutation_seed"].eq(42).all())
+                    if normalization == "brain_mean":
+                        self.assertTrue(saved["normalization_domain"].eq("gmwm_nonzero").all())
+                        self.assertTrue(saved["normalization_mask_rule"].eq("field != 0").all())
                     np.testing.assert_allclose(
                         saved["p_permutation"],
                         frame.set_index("x").loc[saved["x"], "p_permutation"],

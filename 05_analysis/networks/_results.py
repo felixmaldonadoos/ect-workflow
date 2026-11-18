@@ -92,6 +92,7 @@ def normalization_metadata(frame, field_name: str, source_path=None) -> dict:
     result = {"normalization": method, "normalization_tag": expected}
     for column in (
         "normalization_mask_path", "normalization_mask_rule", "normalization_applies_to",
+        "normalization_domain",
     ):
         value = unique_value(column)
         if value is not None:

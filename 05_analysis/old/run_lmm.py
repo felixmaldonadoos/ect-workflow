@@ -93,7 +93,6 @@ def _fingerprint(path: Path) -> dict:
             digest.update(chunk)
     return {"path": str(path.resolve()), "sha256": digest.hexdigest()}
 
-
 def _subject_exclusion_mask(table: pd.DataFrame, subjects: set[str], *, label: str) -> pd.Series:
     """Match whole patients while leaving other rows unchanged for validation."""
     if "subjid" not in table:

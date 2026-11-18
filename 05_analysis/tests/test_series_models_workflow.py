@@ -23,6 +23,7 @@ sys.path.insert(0, str(SOURCE))
 
 from analysis_paths import SOURCE_DIR
 from run_series_mixed_effects import main, parse_args
+from series_models.run_layout import ensure_run_manifest, run_configuration
 from series_models.workflow import run_analysis
 
 
@@ -70,13 +71,13 @@ def arguments(path, kind="roi", analysis_name="series_test", **changes):
 def successful_fit(frame, settings):
     # The fitter's numerical behavior has its own real synthetic-fit tests.
     table = pd.DataFrame({
-        "term": ["Intercept", "E", "E:ef_sf"], "estimate": [0.5, 2.0, 0.25],
-        "std_error": [0.1] * 3, "wald_z": [5.0, 20.0, 2.5],
-        "p_value": [0.001, 0.0001, 0.02], "ci_low": [0.3, 1.8, 0.05],
-        "ci_high": [0.7, 2.2, 0.45], "inference_method": ["asymptotic_normal_wald"] * 3,
+        "term": ["Intercept", "E", "E:ef_sf", "age"], "estimate": [0.5, 2.0, 0.25, 0.03],
+        "std_error": [0.1] * 4, "wald_z": [5.0, 20.0, 2.5, 0.3],
+        "p_value": [0.001, 0.0001, 0.02, 0.76], "ci_low": [0.3, 1.8, 0.05, -0.17],
+        "ci_high": [0.7, 2.2, 0.45, 0.23], "inference_method": ["asymptotic_normal_wald"] * 4,
     })
     return table, {"status": "ok", "error": "", "warnings": "", "converged": True,
-                   "n_observations": len(frame), "age_variance": 1.0,
+                   "n_observations": len(frame),
                    "sex_variance": 0.1, "residual_variance": 0.5}
 
 
@@ -123,6 +124,9 @@ class TestSeriesWorkflow(unittest.TestCase):
         self.assertTrue(table.n_people.eq(4).all())
         self.assertTrue(table.E_estimate.eq(2.0).all())
         self.assertTrue(table.E_ef_sf_estimate.eq(0.25).all())
+        self.assertTrue(table.age_estimate.eq(0.03).all())
+        self.assertTrue(table.age_effect.eq("continuous_fixed").all())
+        self.assertNotIn("age_variance", table)
         self.assertIn("__raw__", result["paths"]["lmm_results"].name)
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), original_digest)
         prepared = pd.read_csv(result["paths"]["model_input"])
@@ -130,19 +134,32 @@ class TestSeriesWorkflow(unittest.TestCase):
         self.assertIn("comments", prepared)
         np.testing.assert_allclose(prepared.E_x_ef_sf, prepared.E * prepared.ef_sf)
         for artifact in result["paths"].values():
-            self.assertTrue(artifact.is_relative_to(self.root / "series_test"))
+            self.assertTrue(artifact.is_relative_to(self.root / "lmm/series_test"))
         manifest = json.loads(result["paths"]["analysis"].read_text())
         self.assertEqual(manifest["planned_fits"], 4)
-        self.assertEqual(manifest["model"]["fixed_formula"], "cgi_change ~ 1 + E + E:ef_sf")
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["model"]["fixed_formula"], "cgi_change ~ 1 + E + E:ef_sf + age")
+        self.assertEqual(manifest["model"]["variance_components"], {"sex": "0 + C(sex)"})
+        self.assertEqual(manifest["model"]["fixed_terms"], ["Intercept", "E", "E:ef_sf", "age"])
+        self.assertEqual(manifest["model"]["age_effect"]["type"], "continuous_fixed")
         self.assertEqual(manifest["fit_settings"]["optimizer"], "powell")
         self.assertEqual(len(manifest["source_master_sha256"]), 64)
 
     def test_normalized_and_raw_masters_get_separate_tables_in_same_analysis(self):
         raw = self.write_master("master raw.csv")
         normed = self.write_master("master normalized.csv", normalization="brain_mean")
+        configuration = run_configuration("random", {
+            "reml": False, "optimizer": "powell", "maxiter": 2000,
+            "boundary_tolerance": 1e-8, "sex_effect": "random",
+        })
+        run_manifest = ensure_run_manifest("series_test", configuration, inputs=[str(raw), str(normed)])
         with patch("series_models.workflow.fit_feature", side_effect=successful_fit):
-            first = run_analysis(arguments(raw))
-            second = run_analysis(arguments(normed))
+            first = run_analysis(arguments(raw, output_component="roi_raw"))
+            second = run_analysis(arguments(normed, output_component="roi_brain_mean"))
+        self.assertEqual(run_manifest, self.root / "lmm/series_test/run.json")
+        self.assertEqual(json.loads(run_manifest.read_text())["input_masters"], sorted([str(raw), str(normed)]))
+        self.assertTrue(first["paths"]["lmm_results"].is_relative_to(self.root / "lmm/series_test/roi_raw"))
+        self.assertTrue(second["paths"]["lmm_results"].is_relative_to(self.root / "lmm/series_test/roi_brain_mean"))
         self.assertNotEqual(first["paths"]["lmm_results"], second["paths"]["lmm_results"])
         self.assertIn("__brain_mean__", second["paths"]["lmm_results"].name)
         table = pd.read_csv(second["paths"]["lmm_results"])
@@ -179,7 +196,7 @@ class TestSeriesWorkflow(unittest.TestCase):
         coefficients = pd.read_csv(result["paths"]["coefficients"])
         self.assertEqual(len(statuses), 4)
         self.assertEqual(len(table), 4)
-        self.assertEqual(len(coefficients), 6)
+        self.assertEqual(len(coefficients), 8)
         self.assertTrue(table.loc[table.status.eq("failed"), "E_p_value"].isna().all())
         self.assertTrue(table.loc[table.status.eq("ok"), "E_p_value"].notna().all())
 
@@ -210,7 +227,7 @@ class TestSeriesWorkflow(unittest.TestCase):
         self.assertEqual(len(status), 4)
         self.assertEqual(len(table), 4)
         self.assertTrue(table.loc[table.status.eq("failed"), "E_p_value"].isna().all())
-        self.assertEqual(len(pd.read_csv(result["paths"]["coefficients"])), 6)
+        self.assertEqual(len(pd.read_csv(result["paths"]["coefficients"])), 8)
 
     def test_prepare_only_validates_each_feature_and_never_calls_fitter(self):
         path = self.write_master(kind="pca")
@@ -220,7 +237,7 @@ class TestSeriesWorkflow(unittest.TestCase):
         self.assertEqual(result["planned_fits"], 4)
         table = pd.read_csv(result["paths"]["lmm_results"])
         self.assertTrue(table.status.eq("prepared").all())
-        self.assertTrue(table.design_rank.eq(3).all())
+        self.assertTrue(table.design_rank.eq(4).all())
         self.assertTrue(table.E_estimate.isna().all())
         self.assertEqual(len(pd.read_csv(result["paths"]["coefficients"])), 0)
 
@@ -269,9 +286,7 @@ class TestSeriesWorkflow(unittest.TestCase):
         sex = np.tile(np.repeat(["F", "M"], 10), 12)
         field = rng.normal(size=len(age))
         factor = rng.uniform(0.5, 2, len(age))
-        age_effect = rng.normal(0, 0.7, 12)
-        age_effect -= age_effect.mean()
-        outcome = (2 + 1.5 * field - 0.6 * field * factor + age_effect[age - 25]
+        outcome = (2 + 1.5 * field - 0.6 * field * factor + 0.03 * age
                    + np.where(sex == "M", 0.6, -0.6) + rng.normal(0, 0.15, len(age)))
         path = self.directory / "synthetic_master.csv"
         pd.DataFrame({
@@ -283,15 +298,22 @@ class TestSeriesWorkflow(unittest.TestCase):
         code = main(["--master-path", str(path), "--feature-type", "roi",
                      "--analysis-name", "synthetic_actual_fit"])
         self.assertEqual(code, 0)
-        table_path, = (self.root / "synthetic_actual_fit").glob("*_lmm_results.csv")
+        table_path, = (self.root / "lmm/synthetic_actual_fit").glob("*_lmm_results.csv")
         table = pd.read_csv(table_path)
         self.assertEqual(len(table), 1)
         self.assertEqual(table.status.iloc[0], "ok")
         self.assertEqual(table.n_observations.iloc[0], 240)
         self.assertEqual(table.n_people.iloc[0], 120)
         self.assertEqual(table.roi_name.iloc[0], "LH_synthetic_ROI")
-        np.testing.assert_allclose(table[["intercept_estimate", "E_estimate", "E_ef_sf_estimate"]].iloc[0],
-                                   [2, 1.5, -0.6], atol=0.12)
+        np.testing.assert_allclose(table[["E_estimate", "E_ef_sf_estimate"]].iloc[0],
+                                   [1.5, -0.6], atol=0.12)
+        self.assertAlmostEqual(table.age_estimate.iloc[0], 0.03, delta=0.01)
+        self.assertAlmostEqual(table.intercept_estimate.iloc[0] + table.age_estimate.iloc[0] * age.mean(),
+                               2 + 0.03 * age.mean(), delta=0.12)
+        self.assertTrue(table.age_effect.eq("continuous_fixed").all())
+        self.assertTrue(table.fixed_formula.eq("cgi_change ~ 1 + E + E:ef_sf + age").all())
+        self.assertNotIn("age_variance", table)
+        self.assertEqual(len(pd.read_csv(next(table_path.parent.glob("*_coefficients.csv")))), 4)
         self.assertTrue(table[["intercept_p_value", "E_p_value", "E_ef_sf_p_value"]].notna().all(axis=None))
 
     def test_cli_environment_validation_precedes_scientific_imports(self):
@@ -311,7 +333,7 @@ class TestSeriesWorkflow(unittest.TestCase):
         master_rows().assign(ef_sf=1).to_csv(path, index=False)
         self.assertEqual(main(["--master-path", str(path), "--feature-type", "roi",
                                "--analysis-name", "cli_test", "--prepare-only"]), 0)
-        self.assertEqual(len(list((self.root / "cli_test").glob("*_fit_status.csv"))), 1)
+        self.assertEqual(len(list((self.root / "lmm/cli_test").glob("*_fit_status.csv"))), 1)
 
     def test_cli_nonconvergence_is_success_with_failure_saved_for_every_feature(self):
         path = self.write_master()
@@ -326,7 +348,7 @@ class TestSeriesWorkflow(unittest.TestCase):
             code = main(["--master-path", str(path), "--feature-type", "roi",
                          "--analysis-name", "nonconverged_cli"])
         self.assertEqual(code, 0)
-        output = self.root / "nonconverged_cli"
+        output = self.root / "lmm/nonconverged_cli"
         status = pd.read_csv(next(output.glob("*_fit_status.csv")))
         results = pd.read_csv(next(output.glob("*_lmm_results.csv")))
         self.assertEqual(len(status), 4)

@@ -14,10 +14,11 @@ raise errors. No observations are silently dropped. P-values are unadjusted;
 the analysis does not adjust for covariates or repeated persons across series.
 
 Examples:
+    export RESULTS_DIR=/path/to/results
     python mni_yeo2011_correlations.py
     python mni_yeo2011_correlations.py --no-network-means
     python mni_yeo2011_correlations.py --master-path /path/to/master.csv \
-        --output-path /path/to/correlations.csv
+        --output-path "$RESULTS_DIR/mni_yeo2011/data/correlations.csv"
 
 Requires Python >= 3.10, numpy, pandas, and scipy.
 """
@@ -26,15 +27,26 @@ import argparse
 from pathlib import Path
 import re
 
+if __package__ in (None, ""):
+    from _results import (
+        add_analysis_argument, bootstrap_cli, correlation_output_path,
+        default_master_path, normalization_metadata, validate_output_path,
+    )
+else:
+    from ._results import (
+        add_analysis_argument, bootstrap_cli, correlation_output_path,
+        default_master_path, normalization_metadata, validate_output_path,
+    )
+
+if __name__ == "__main__":
+    bootstrap_cli()
+
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
 
 DEFAULT_FIELD_NAME = "magnE_mean"
-DEFAULT_MASTER_DIR = Path(
-    "/projects/p32903/Alex2/ect-workflow/05_analysis/networks/data"
-)
 NETWORKS = ("Vis", "SomMot", "DorsAttn", "SalVentAttn", "Limbic", "Cont", "Default")
 
 
@@ -199,16 +211,18 @@ def annotate_correlation_features(results: pd.DataFrame) -> pd.DataFrame:
 
 
 def save_spearman_table(df: pd.DataFrame, filename: str | Path) -> pd.DataFrame:
-    """Save source-aware feature names and explicit field/metric/ROI metadata."""
+    """Save source-aware features and retain provenance and extra result columns."""
+    output_path = validate_output_path(filename)
     columns = [
         "x", "y", "n", "rho", "p_value", "field_name", "metric", "model_type", "step"
     ]
     missing = set(columns) - set(df.columns)
     if missing:
         raise KeyError(f"Missing correlation columns: {sorted(missing)}")
-    result = annotate_correlation_features(df[columns])
-    result = result[[*columns, "roi_org", "roi", "hemi", "network"]]
-    output_path = Path(filename)
+    result = annotate_correlation_features(df)
+    leading = [*columns, "roi_org", "roi", "hemi", "network"]
+    extra = [column for column in result.columns if column not in leading]
+    result = result[[*leading, *extra]]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_path, index=False)
     return result
@@ -312,11 +326,13 @@ def run_master_spearman(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Run Spearman correlations between cgi_change and each ROI mean "
             "separately for every model_type x step subset in the master CSV."
         )
     )
+    add_analysis_argument(parser)
     parser.add_argument(
         "--field-name", default=DEFAULT_FIELD_NAME,
         help="Source field to select from the master (default: %(default)s).",
@@ -324,13 +340,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--master-path", type=Path,
         help=(
-            f"Master CSV (default: {DEFAULT_MASTER_DIR}/"
+            "Master CSV (default: $RESULTS_DIR/<analysis-name>/data/"
             "yeo2011_<field-name>_series_ROI_master.csv)."
         ),
     )
     parser.add_argument(
         "--output-path", type=Path,
-        help="Output CSV (default: notebook filename beside the selected master).",
+        help=(
+            "Output CSV inside $RESULTS_DIR/<analysis-name>/ "
+            "(default: normalization-aware filename in its data/ directory)."
+        ),
     )
     parser.add_argument(
         "--no-network-means", action="store_true",
@@ -347,22 +366,33 @@ def main(argv: list[str] | None = None) -> int:
     field_name = args.field_name
     master_path = args.master_path
     if master_path is None:
-        master_path = DEFAULT_MASTER_DIR / f"yeo2011_{field_name}_series_ROI_master.csv"
+        master_path = default_master_path(args.analysis_name, field_name)
+
+    if args.output_path is not None:
+        validate_output_path(args.output_path, analysis_name=args.analysis_name)
+
+    master = load_roi_master(master_path)
+    metadata = normalization_metadata(master, field_name, source_path=master_path)
 
     include_network_means = not args.no_network_means
     scope = "ROImean_and_network" if include_network_means else "ROImean_only"
     output_path = args.output_path
     if output_path is None:
-        output_path = master_path.parent / f"spearman_{field_name}_{scope}_annotated.csv"
+        output_path = correlation_output_path(
+            args.analysis_name, field_name, scope, metadata,
+        )
+    output_path = validate_output_path(output_path, analysis_name=args.analysis_name)
     if output_path.resolve() == master_path.resolve():
         raise ValueError("Output path must differ from the input master CSV.")
 
-    master = load_roi_master(master_path)
     print(f"Loaded {len(master):,} ROI rows from {master_path}", flush=True)
     results = run_master_spearman(
         master, field_name=field_name, y="cgi_change",
         include_network_means=include_network_means,
     )
+    results["master_path"] = str(master_path.resolve())
+    for column, value in metadata.items():
+        results[column] = value
     annotated = save_spearman_table(results, output_path)
     print(summarize_spearman_results(annotated).to_string(), flush=True)
     print(f"Saved {len(annotated):,} correlations to {output_path}", flush=True)

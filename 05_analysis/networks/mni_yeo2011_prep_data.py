@@ -1,6 +1,20 @@
-import pandas as pd 
+import argparse
 import sys
 from pathlib import Path
+
+if __package__ in (None, ""):
+    from _results import (
+        add_analysis_argument, bootstrap_cli, default_master_path, validate_output_path,
+    )
+else:
+    from ._results import (
+        add_analysis_argument, bootstrap_cli, default_master_path, validate_output_path,
+    )
+
+if __name__ == "__main__":
+    bootstrap_cli()
+
+import pandas as pd
 import re
 import numpy as np
 from nilearn import image, masking, plotting
@@ -9,7 +23,7 @@ from scipy.stats import (
     mode,
 )
 
-analysis_dir = Path("/projects/p32903/Alex2/ect-workflow/05_analysis")
+analysis_dir = Path(__file__).resolve().parents[1]
 if str(analysis_dir) not in sys.path: sys.path.insert(0, str(analysis_dir))
 from simnibs_parcel_analysis.utils.loader import (
     load_query_results,
@@ -682,9 +696,11 @@ def parse_roi_metadata(df: pd.DataFrame) -> pd.DataFrame:
     return result[columns]
 
 
-def save_roi_master(master: pd.DataFrame, filename: str | Path) -> Path:
+def save_roi_master(
+    master: pd.DataFrame, filename: str | Path, *, analysis_name: str | None = None,
+) -> Path:
     """Save an already-built master dataframe."""
-    output_path = Path(filename)
+    output_path = validate_output_path(filename, analysis_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     master.to_csv(output_path, index=False)
@@ -696,8 +712,30 @@ def save_roi_master(master: pd.DataFrame, filename: str | Path) -> Path:
 
     return output_path
 
-if __name__ == '__main__':
-    field_name = "magnE_mean"
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Prepare the Yeo2011 series/ROI master under RESULTS_DIR.",
+        allow_abbrev=False,
+    )
+    add_analysis_argument(parser)
+    parser.add_argument("--field-name", default="magnE_mean")
+    parser.add_argument(
+        "--output-path", type=Path,
+        help="Master CSV inside RESULTS_DIR/<analysis_name>/ (default: data/yeo2011_<field>_series_ROI_master.csv).",
+    )
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.field_name):
+        parser.error("--field-name must be a nonempty field identifier without path separators.")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    field_name = args.field_name
+    output_path = validate_output_path(
+        args.output_path if args.output_path is not None else default_master_path(args.analysis_name, field_name),
+        args.analysis_name,
+    )
 
     fn_query = '/projects/p32903/Alex2/ect-results-tools/query_result_2.csv'
     fn_cgi   = '/projects/p32903/Alex2/datasets/STU00225089/.clincal_notes/cgi_batch_latest_20261029_1207.xlsx'
@@ -729,5 +767,11 @@ if __name__ == '__main__':
 
     saved_path = save_roi_master(
         df_series_roi_master,
-        f"data/yeo2011_{field_name}_series_ROI_master.csv",
+        output_path,
+        analysis_name=args.analysis_name,
     )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

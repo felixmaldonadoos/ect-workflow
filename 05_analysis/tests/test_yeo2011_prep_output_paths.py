@@ -112,6 +112,16 @@ class TestPrepOutputPaths(unittest.TestCase):
         tag = "normed_brain_magnE_mean_mean"
         legacy = normalization_metadata(raw, "magnE_mean", source_path=f"legacy_{tag}_annotated.csv")
         self.assertEqual(legacy["normalization"], "brain_mean")
+        self.assertNotIn("normalization_domain", legacy)
+        gmwm = pd.DataFrame({
+            "field_name": ["magnE_mean"], "normalization": ["brain_mean"],
+            "normalization_tag": [tag], "normalization_domain": ["gmwm_nonzero"],
+            "normalization_mask_rule": ["field != 0"], "normalization_mask_path": [""],
+        })
+        gmwm_metadata = normalization_metadata(gmwm, "magnE_mean")
+        self.assertEqual(gmwm_metadata["normalization_domain"], "gmwm_nonzero")
+        self.assertEqual(gmwm_metadata["normalization_mask_rule"], "field != 0")
+        self.assertNotIn("normalization_mask_path", gmwm_metadata)
         mixed = pd.DataFrame({"field_name": ["magnE_mean"] * 2, "normalization": ["raw", "brain_mean"]})
         with self.assertRaisesRegex(ValueError, "Mixed"):
             normalization_metadata(mixed, "magnE_mean")

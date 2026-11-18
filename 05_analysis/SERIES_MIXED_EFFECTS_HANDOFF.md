@@ -1,5 +1,10 @@
 # Handoff: mixed effects models from ROI and NIfTI PCA series masters
 
+> Specification update, 2026-11-03: age is now a continuous fixed covariate.
+> The implemented model is `cgi_change ~ 1 + E + E:ef_sf + age + (1 | sex)`.
+> See `SERIES_MIXED_EFFECTS_README.md` for the current runner and outputs.
+> The original age/sex random-intercept specification below is historical.
+
 Prepared 2026-11-02. Repository: `/projects/p32903/Alex2/ect-workflow`.
 All relative code paths below are relative to `05_analysis/`.
 This document specifies the next task; the new modeling runner has not been implemented.

@@ -68,6 +68,7 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from analysis_paths import resolve_analysis_dir, validate_output_path
 from run_series_mixed_effects import parse_args
+from series_models.run_layout import ensure_run_manifest, run_configuration
 
 args = parse_args(sys.argv[2:])
 try:
@@ -76,14 +77,21 @@ try:
         raise ValueError(f"Master path is not a file: {master}")
     with master.open("rb"):
         pass
+    ensure_run_manifest(args.analysis_name,
+        run_configuration(args.sex_effect, {"reml": args.reml, "optimizer": args.optimizer,
+                                           "maxiter": args.maxiter}, args.field_name,
+                          prepare_only=args.prepare_only), inputs=[str(master)], create=False)
+    analysis_dir = resolve_analysis_dir(args.analysis_name)
+    if any(analysis_dir.glob("analysis*.json")) or (analysis_dir / "fit_status.csv").exists():
+        raise ValueError(f"Model artifacts already exist; choose a new analysis/run name: {analysis_dir}")
     directory = validate_output_path(
-        resolve_analysis_dir(args.analysis_name) / "logs", args.analysis_name
+        analysis_dir / "logs", args.analysis_name
     )
     validate_output_path(directory / "%j.out", args.analysis_name)
     validate_output_path(directory / "%j.err", args.analysis_name)
 except (OSError, ValueError) as error:
     raise SystemExit(str(error)) from error
-print(json.dumps([str(master), str(directory)]))
+print(json.dumps([str(master), str(directory), args.analysis_name]))
 PY
 )"
 
@@ -92,12 +100,15 @@ PY
 mapfile -d '' -t VALIDATED_PATHS < <(
     "$VALIDATE_PYTHON" -B -c 'import json, sys; sys.stdout.write("\0".join(json.loads(sys.argv[1])) + "\0")' "$VALIDATION_JSON"
 )
-if (( ${#VALIDATED_PATHS[@]} != 2 )); then
+if (( ${#VALIDATED_PATHS[@]} != 3 )); then
     echo "Could not decode validated submission paths." >&2
     exit 2
 fi
 MASTER_PATH="${VALIDATED_PATHS[0]}"
 LOG_DIR="${VALIDATED_PATHS[1]}"
+ANALYSIS_NAME="${VALIDATED_PATHS[2]}"
+JOB_NAME="${ANALYSIS_NAME#lmm/}"
+JOB_NAME="${JOB_NAME//\//_}"
 
 # Retain CLI argument order and both argparse spellings while replacing master
 # values with the validated absolute path. parse_args has already checked that
@@ -130,7 +141,7 @@ SBATCH_COMMAND=(
     sbatch
     --export=ALL
     --chdir="$SCRIPT_ROOT"
-    --job-name="$ANALYSIS_NAME"
+    --job-name="$JOB_NAME"
     --output="$LOG_DIR/%x_%j.out"
     --error="$LOG_DIR/%x_%j.err"
     "$SLURM_SCRIPT" --analysis-name "$ANALYSIS_NAME" "${FORWARDED_ARGUMENTS[@]}"
